@@ -1,0 +1,26 @@
+# Local configuration and secrets
+config.json
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Build outputs
+build/
+build_*/
+dist/
+*.exe
+*.pkg
+*.pyz
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

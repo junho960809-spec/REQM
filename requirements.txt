@@ -1,0 +1,5 @@
+PySide6>=6.7,<7
+supabase>=2.6,<3
+openpyxl>=3.1,<4
+xlrd>=2.0,<3
+pyinstaller>=6.10,<7
