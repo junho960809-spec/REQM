@@ -22,6 +22,10 @@
 
 이카운트 API 인증키는 프로그램 실행 중에만 입력하며 파일에 저장하지 않습니다. Supabase 비밀번호, `service_role` 키, 이카운트 API 인증키는 GitHub에 커밋하지 마세요.
 
+## AI 및 개발자 인수인계
+
+다른 PC나 AI에서 작업을 이어갈 때는 [`AI_HANDOFF.md`](AI_HANDOFF.md)를 먼저 읽고 안내된 문서를 순서대로 확인합니다.
+
 ## 실행파일 빌드
 
 ```powershell
