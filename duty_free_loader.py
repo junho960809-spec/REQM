@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 from typing import Any
 
 import openpyxl
@@ -14,6 +15,57 @@ def clean(value: Any) -> str:
 
 def norm(value: Any) -> str:
     return "".join(clean(value).lower().split()).replace(".", "")
+
+
+COLOR_WORDS = {
+    "블랙", "화이트", "핑크", "그레이", "그린", "블루", "레드", "옐로우", "오렌지",
+    "퍼플", "베이지", "민트", "라벤더", "라밴더", "버터", "캐롯", "캐럿", "샌드",
+    "코발트블루", "세이지민트", "올리브", "브라운", "네이비",
+}
+
+
+def _model_tokens(value: Any) -> set[str]:
+    text = clean(value).lower()
+    return {
+        re.sub(r"[^a-z0-9]", "", token)
+        for token in re.findall(r"[a-z]{1,8}[-_ ]?\d+[a-z0-9]*", text)
+        if len(re.sub(r"[^a-z0-9]", "", token)) >= 4
+    }
+
+
+def _colors(value: Any) -> set[str]:
+    text = norm(value).replace("블루투스", "")
+    aliases = {"라밴더": "라벤더", "캐럿": "캐롯"}
+    return {aliases.get(color, color) for color in COLOR_WORDS if color in text}
+
+
+def barcode_name_error(product_name: str, item: dict) -> str:
+    """Return a reason when a barcode's DB item clearly conflicts with the source product."""
+    db_text = " ".join(
+        clean(item.get(key, ""))
+        for key in ("standard_name", "model", "color", "form")
+    )
+    source_norm, db_norm = norm(product_name), norm(db_text)
+
+    source_models = _model_tokens(product_name)
+    db_models = _model_tokens(db_text)
+    model_overlap = any(
+        source.startswith(db) or db.startswith(source)
+        for source in source_models for db in db_models
+    )
+    if source_models and db_models and not model_overlap:
+        return f"상품 모델 불일치: 파일 {', '.join(sorted(source_models))} / DB {', '.join(sorted(db_models))}"
+
+    source_colors = _colors(product_name)
+    db_colors = _colors(db_text)
+    if source_colors and db_colors and source_colors.isdisjoint(db_colors):
+        return f"상품 색상 불일치: 파일 {', '.join(sorted(source_colors))} / DB {', '.join(sorted(db_colors))}"
+
+    source_is_set = "세트" in source_norm or "+" in clean(product_name)
+    db_is_set = "세트" in db_norm or str(item.get("item_code", "")).upper().startswith("SET-")
+    if source_is_set and not db_is_set:
+        return "파일은 세트 상품이지만 바코드는 DB 단품에 연결됨"
+    return ""
 
 
 def load_duty_free(file_path: str) -> tuple[list[dict[str, str]], str] | None:
@@ -87,12 +139,19 @@ def match_barcodes(rows: list[dict[str, str]], barcodes: list[dict], items: list
         item_code = barcode_map.get(row.get("barcode", ""), "")
         item = item_map.get(item_code)
         if item:
-            row.update({
-                "status": "exact", "matched_product": str(item.get("standard_name", "")),
-                "components": item_code, "reason": "면세점 바코드 정확 일치",
-            })
+            mismatch = barcode_name_error(row.get("product_name", ""), item)
+            if mismatch:
+                row.update({
+                    "status": "barcode_error", "matched_product": str(item.get("standard_name", "")),
+                    "components": item_code, "reason": "바코드-상품 불일치 · " + mismatch,
+                })
+            else:
+                row.update({
+                    "status": "exact", "matched_product": str(item.get("standard_name", "")),
+                    "components": item_code, "reason": "면세점 바코드 정확 일치",
+                })
         else:
             row.update({
-                "status": "missing", "matched_product": "", "components": "",
-                "reason": "바코드가 DB에 등록되지 않음",
+                "status": "barcode_error", "matched_product": "", "components": "",
+                "reason": "바코드 오류 · DB에 등록되지 않은 바코드",
             })

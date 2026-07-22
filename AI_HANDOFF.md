@@ -11,8 +11,8 @@
 
 ## 현재 기준 상태
 
-- 기준 버전: 1.0.4
-- 작업 브랜치: `agent/ecount-transfer-1.0.4`
+- 기준 버전: 1.0.5 통합 작업 중
+- 작업 브랜치: `agent/ecount-transfer-integrated-1.0.5`
 - 기본 브랜치: `main`
 - GUI: Python + PySide6
 - 데이터베이스 및 인증: Supabase
