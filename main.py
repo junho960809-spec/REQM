@@ -3,15 +3,17 @@ import sys
 import hashlib
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QDate, Qt, QThread, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDateEdit,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -34,6 +36,7 @@ from matcher import ProductMatcher
 from matcher import compact
 from shipping_export import export_wekep
 from duty_free_loader import load_duty_free, match_barcodes
+from ecount_transfer import EcountClient, aggregate_transfer_rows, match_transfer_rows, read_transfer_file
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -41,6 +44,9 @@ CONFIG_PATH = APP_DIR / "config.json"
 DEFAULT_CONFIG = {
     "supabase_url": "https://jcslohuraqclhryeqxoc.supabase.co",
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
+    "ecount_com_code": "304293",
+    "ecount_user_id": "ororamobile",
+    "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
 
@@ -268,6 +274,14 @@ class LoginWorker(QThread):
             barcodes = fetch_all("item_barcodes")
             duty_locations = fetch_all("duty_free_locations")
             try:
+                employees = fetch_all("ecount_employees")
+            except Exception:
+                employees = []
+            try:
+                warehouses = fetch_all("ecount_warehouses")
+            except Exception:
+                warehouses = []
+            try:
                 aliases = fetch_all("item_aliases")
             except Exception:
                 aliases = []
@@ -279,11 +293,316 @@ class LoginWorker(QThread):
             self.succeeded.emit(
                 len(items),
                 {"items": items, "products": products, "components": components, "barcodes": barcodes,
-                 "duty_locations": duty_locations, "aliases": aliases, "client": client,
+                 "duty_locations": duty_locations, "aliases": aliases, "employees": employees,
+                 "warehouses": warehouses, "client": client,
                  "auth_user_id": str(auth_result.user.id), "app_role": app_role},
             )
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class LookupLineEdit(QLineEdit):
+    lookupRequested = Signal()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.lookupRequested.emit()
+            return
+        super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.lookupRequested.emit()
+        super().mouseDoubleClickEvent(event)
+
+
+class LookupDialog(QDialog):
+    def __init__(self, title: str, rows: list[dict], code_key: str, name_key: str, parent=None):
+        super().__init__(parent)
+        self.rows, self.code_key, self.name_key = rows, code_key, name_key
+        self.filtered_rows = rows
+        self.setWindowTitle(title)
+        self.resize(560, 480)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("코드 또는 이름 검색")
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["코드", "이름"])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.search)
+        layout.addWidget(self.table)
+        layout.addWidget(buttons)
+        self.search.textChanged.connect(self.refresh)
+        self.table.cellDoubleClicked.connect(lambda *_: self.accept_selected())
+        buttons.accepted.connect(self.accept_selected)
+        buttons.rejected.connect(self.reject)
+        self.refresh()
+
+    def refresh(self):
+        word = self.search.text().strip().lower()
+        self.filtered_rows = [row for row in self.rows if word in f"{row.get(self.code_key, '')} {row.get(self.name_key, '')}".lower()]
+        self.table.setRowCount(len(self.filtered_rows))
+        for index, row in enumerate(self.filtered_rows):
+            self.table.setItem(index, 0, QTableWidgetItem(str(row.get(self.code_key, ""))))
+            self.table.setItem(index, 1, QTableWidgetItem(str(row.get(self.name_key, ""))))
+        if self.filtered_rows:
+            self.table.selectRow(0)
+
+    def accept_selected(self):
+        if 0 <= self.table.currentRow() < len(self.filtered_rows):
+            self.accept()
+
+    def selected_text(self) -> str:
+        if not (0 <= self.table.currentRow() < len(self.filtered_rows)):
+            return ""
+        row = self.filtered_rows[self.table.currentRow()]
+        return f"{row.get(self.code_key, '')} | {row.get(self.name_key, '')}"
+
+
+class FileDropZone(QFrame):
+    filesDropped = Signal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setMinimumHeight(76)
+        self.setStyleSheet("QFrame { border: 2px dashed #9bbce5; border-radius: 10px; background: #f7fbff; }")
+        layout = QVBoxLayout(self)
+        label = QLabel("엑셀 또는 PDF 파일을 여기에 드래그 앤 드롭하세요")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+
+    def dragEnterEvent(self, event):
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        if paths and all(Path(path).suffix.lower() in {".xls", ".xlsx", ".pdf"} for path in paths):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        self.filesDropped.emit(paths)
+        event.acceptProposedAction()
+
+
+class EcountTransferDialog(QDialog):
+    STATUS_LABELS = {"exact": "정확", "similar": "유사", "ambiguous": "확인필요", "missing": "미등록"}
+    STATUS_COLORS = {"exact": QColor("#d9ead3"), "similar": QColor("#fff2cc"), "ambiguous": QColor("#fce5cd"), "missing": QColor("#f4cccc")}
+
+    def __init__(self, catalog: dict, parent=None):
+        super().__init__(parent)
+        self.catalog = catalog
+        self.rows = []
+        self.setWindowTitle("이카운트 창고이동 보드")
+        self.resize(1120, 720)
+
+        self.io_date = QDateEdit(QDate.currentDate())
+        self.io_date.setCalendarPopup(True)
+        self.io_date.setDisplayFormat("yyyy-MM-dd")
+        self.io_date.lineEdit().setReadOnly(True)
+        self.employee = LookupLineEdit(); self.employee.setPlaceholderText("엔터/더블클릭으로 담당자 선택 또는 코드 직접 입력")
+        self.from_warehouse = LookupLineEdit(); self.from_warehouse.setPlaceholderText("엔터/더블클릭으로 보내는 창고 선택 또는 코드 직접 입력")
+        self.to_warehouse = LookupLineEdit(); self.to_warehouse.setPlaceholderText("엔터/더블클릭으로 받는 창고 선택 또는 코드 직접 입력")
+        self.remarks = QLineEdit("출고 프로그램 창고이동")
+        self.employee.lookupRequested.connect(self.choose_employee)
+        self.from_warehouse.lookupRequested.connect(lambda: self.choose_warehouse(self.from_warehouse, "보내는 창고 선택"))
+        self.to_warehouse.lookupRequested.connect(lambda: self.choose_warehouse(self.to_warehouse, "받는 창고 선택"))
+        self.employee.textChanged.connect(lambda: self.complete_code(self.employee, self.catalog.get("employees", []), "employee_code", "employee_name"))
+        self.from_warehouse.textChanged.connect(lambda: self.complete_code(self.from_warehouse, self.catalog.get("warehouses", []), "warehouse_code", "warehouse_name"))
+        self.to_warehouse.textChanged.connect(lambda: self.complete_code(self.to_warehouse, self.catalog.get("warehouses", []), "warehouse_code", "warehouse_name"))
+
+        form = QFormLayout()
+        form.addRow("일자", self.io_date)
+        form.addRow("담당자", self.employee)
+        form.addRow("보내는 창고", self.from_warehouse)
+        form.addRow("받는 창고", self.to_warehouse)
+        form.addRow("적요", self.remarks)
+
+        self.drop_zone = FileDropZone()
+        self.drop_zone.filesDropped.connect(self.load_files)
+        find_button = QPushButton("파일 찾기")
+        find_button.clicked.connect(self.find_files)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["상태", "입력 품목코드", "입력 품목명", "적용 품목코드", "적용 품목명", "수량", "판정 이유"])
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.DoubleClicked | QTableWidget.EditTrigger.EditKeyPressed)
+        self.table.cellDoubleClicked.connect(self.edit_transfer_item)
+
+        config = load_config()
+        self.api_values = {
+            "com_code": str(config.get("ecount_com_code", "304293")),
+            "user_id": str(config.get("ecount_user_id", "ororamobile")),
+            "zone": str(config.get("ecount_zone", "AB")),
+            "api_key": "",
+        }
+        info_button = QPushButton("정보")
+        info_button.setMaximumWidth(64)
+        info_button.clicked.connect(self.show_api_info)
+        edit_item_button = QPushButton("선택 행 품목 수정")
+        edit_item_button.clicked.connect(lambda: self.edit_transfer_item(self.table.currentRow(), 3))
+
+        submit_button = QPushButton("이카운트 창고이동 등록")
+        submit_button.setObjectName("exportButton")
+        submit_button.clicked.connect(self.submit_transfer)
+        close_button = QPushButton("닫기"); close_button.clicked.connect(self.reject)
+        button_row = QHBoxLayout(); button_row.addStretch(1); button_row.addWidget(submit_button); button_row.addWidget(close_button)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("이카운트 창고이동")
+        title.setStyleSheet("font-size: 21px; font-weight: 800; color: #172b4d;")
+        title_row = QHBoxLayout(); title_row.addWidget(title); title_row.addStretch(1); title_row.addWidget(info_button)
+        layout.addLayout(title_row); layout.addLayout(form); layout.addWidget(self.drop_zone); layout.addWidget(find_button)
+        layout.addWidget(self.table, 1); layout.addWidget(edit_item_button); layout.addLayout(button_row)
+
+    def choose_employee(self):
+        dialog = LookupDialog("담당자 선택", self.catalog.get("employees", []), "employee_code", "employee_name", self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.employee.setText(dialog.selected_text())
+
+    def choose_warehouse(self, target: QLineEdit, title: str):
+        dialog = LookupDialog(title, self.catalog.get("warehouses", []), "warehouse_code", "warehouse_name", self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            target.setText(dialog.selected_text())
+
+    @staticmethod
+    def complete_code(target: QLineEdit, rows: list[dict], code_key: str, name_key: str):
+        text = target.text().strip()
+        if not text or "|" in text:
+            return
+        matched = next((row for row in rows if str(row.get(code_key, "")).strip() == text), None)
+        if matched:
+            target.blockSignals(True)
+            target.setText(f"{matched.get(code_key, '')} | {matched.get(name_key, '')}")
+            target.setCursorPosition(len(target.text()))
+            target.blockSignals(False)
+
+    def show_api_info(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("이카운트 API 정보")
+        dialog.setFixedWidth(430)
+        com_code = QLineEdit(self.api_values["com_code"])
+        user_id = QLineEdit(self.api_values["user_id"])
+        zone = QLineEdit(self.api_values["zone"])
+        api_key = QLineEdit(self.api_values["api_key"])
+        api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        api_key.setPlaceholderText("API 인증키 (프로그램 종료 시 삭제)")
+        form = QFormLayout()
+        form.addRow("로그인 코드", com_code)
+        form.addRow("이카운트 ID", user_id)
+        form.addRow("ZONE", zone)
+        form.addRow("API 인증키", api_key)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        layout = QVBoxLayout(dialog); layout.addLayout(form); layout.addWidget(buttons)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.api_values.update({"com_code": com_code.text().strip(), "user_id": user_id.text().strip(), "zone": zone.text().strip(), "api_key": api_key.text().strip()})
+
+    def edit_transfer_item(self, row_index: int, column_index: int):
+        if row_index < 0 or column_index not in {3, 4}:
+            return
+        dialog = LookupDialog("적용 품목 선택", self.catalog.get("items", []), "item_code", "standard_name", self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.filtered_rows[dialog.table.currentRow()]
+        self.rows[row_index]["item_code"] = str(selected.get("item_code", ""))
+        self.rows[row_index]["item_name"] = str(selected.get("standard_name", ""))
+        self.rows[row_index]["status"] = "similar"
+        self.rows[row_index]["reason"] = "사용자 품목 수정"
+        self.populate_table()
+        self.table.selectRow(row_index)
+
+    def find_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "창고이동 품목 파일 선택", "", "Excel/PDF (*.xls *.xlsx *.pdf)")
+        if paths:
+            self.load_files(paths)
+
+    def load_files(self, paths: list[str]):
+        try:
+            raw_rows = []
+            for path in paths:
+                raw_rows.extend(read_transfer_file(path))
+            matched = match_transfer_rows(raw_rows, self.catalog.get("items", []), self.catalog.get("products", []), self.catalog.get("components", []))
+            self.rows = aggregate_transfer_rows(matched)
+            self.populate_table()
+        except Exception as exc:
+            QMessageBox.critical(self, "파일 분석 실패", str(exc))
+
+    def populate_table(self):
+        self.table.setRowCount(len(self.rows))
+        keys = ["status", "source_code", "source_name", "item_code", "item_name", "quantity", "reason"]
+        for row_index, row in enumerate(self.rows):
+            color = self.STATUS_COLORS.get(row.get("status"), QColor("white"))
+            for col_index, key in enumerate(keys):
+                value = self.STATUS_LABELS.get(row.get(key), row.get(key, "")) if key == "status" else row.get(key, "")
+                if key == "quantity":
+                    number = float(value or 0); value = str(int(number)) if number.is_integer() else str(number)
+                item = QTableWidgetItem(str(value))
+                item.setBackground(color)
+                if key in {"status", "reason"}:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.table.setItem(row_index, col_index, item)
+
+    @staticmethod
+    def _code_from_input(value: str, rows: list[dict], code_key: str, name_key: str) -> str:
+        text = value.strip()
+        if "|" in text:
+            return text.split("|", 1)[0].strip()
+        for row in rows:
+            if text in {str(row.get(code_key, "")).strip(), str(row.get(name_key, "")).strip()}:
+                return str(row.get(code_key, "")).strip()
+        return text
+
+    def rows_from_table(self) -> list[dict]:
+        result = []
+        for row_index in range(self.table.rowCount()):
+            code = self.table.item(row_index, 3).text().strip() if self.table.item(row_index, 3) else ""
+            name = self.table.item(row_index, 4).text().strip() if self.table.item(row_index, 4) else ""
+            qty_text = self.table.item(row_index, 5).text().strip() if self.table.item(row_index, 5) else ""
+            try:
+                quantity = float(qty_text.replace(",", ""))
+            except ValueError:
+                raise ValueError(f"{row_index + 1}행 수량을 확인해 주세요.")
+            if not code or not name or quantity <= 0:
+                raise ValueError(f"{row_index + 1}행의 품목코드·품목명·수량을 확인해 주세요.")
+            result.append({"item_code": code, "item_name": name, "quantity": quantity})
+        return result
+
+    def submit_transfer(self):
+        if not self.rows:
+            QMessageBox.warning(self, "품목 없음", "먼저 엑셀 또는 PDF 파일을 입력해 주세요."); return
+        employees, warehouses = self.catalog.get("employees", []), self.catalog.get("warehouses", [])
+        employee_code = self._code_from_input(self.employee.text(), employees, "employee_code", "employee_name")
+        from_code = self._code_from_input(self.from_warehouse.text(), warehouses, "warehouse_code", "warehouse_name")
+        to_code = self._code_from_input(self.to_warehouse.text(), warehouses, "warehouse_code", "warehouse_name")
+        if not employee_code or not from_code or not to_code:
+            QMessageBox.warning(self, "필수값", "담당자, 보내는 창고, 받는 창고를 입력해 주세요."); return
+        if from_code == to_code:
+            QMessageBox.warning(self, "창고 확인", "보내는 창고와 받는 창고는 달라야 합니다."); return
+        if not self.api_values.get("api_key", "").strip():
+            QMessageBox.warning(self, "API 인증키", "오른쪽 위 정보 버튼을 눌러 이카운트 API 인증키를 입력해 주세요."); return
+        try:
+            rows = self.rows_from_table()
+        except Exception as exc:
+            QMessageBox.warning(self, "품목 확인", str(exc)); return
+        answer = QMessageBox.question(self, "실제 창고이동 등록", f"{len(rows)}개 품목을 이카운트에 실제 등록합니다.\n{from_code} → {to_code}\n계속할까요?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            client = EcountClient(self.api_values["com_code"], self.api_values["user_id"], self.api_values["api_key"], self.api_values["zone"])
+            session_id = client.login()
+            result = client.save_location_transfer(session_id, rows, self.io_date.date().toString("yyyyMMdd"), employee_code, from_code, to_code, self.remarks.text().strip())
+            data = result.get("Data") or {}
+            success, fail = int(data.get("SuccessCnt") or 0), int(data.get("FailCnt") or 0)
+            slips = ", ".join(str(value) for value in (data.get("SlipNos") or [])) or "없음"
+            details = "\n".join(str(row.get("TotalError", "")) for row in (data.get("ResultDetails") or []))
+            if result.get("Status") == "200" and fail == 0 and success > 0:
+                QMessageBox.information(self, "등록 완료", f"성공 {success}건 / 실패 {fail}건\n전표번호: {slips}")
+            else:
+                QMessageBox.warning(self, "등록 결과 확인", f"성공 {success}건 / 실패 {fail}건\n전표번호: {slips}\n{details}")
+        except Exception as exc:
+            QMessageBox.critical(self, "이카운트 등록 실패", str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -296,7 +615,7 @@ class MainWindow(QMainWindow):
         self.current_mode = "parcel"
         self.current_orders: list[dict[str, str]] = []
         self.is_admin = False
-        self.setWindowTitle("리큐엠 출고용 데모버전")
+        self.setWindowTitle("리큐엠 출고용 데모버전 1.0.4")
         self.resize(1280, 720)
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #f4f7fb; color: #243247; font-family: '맑은 고딕'; font-size: 13px; }
@@ -341,6 +660,8 @@ class MainWindow(QMainWindow):
         self.db_button.setObjectName("adminButton")
         self.db_button.setMaximumWidth(155)
         self.db_button.setEnabled(False)
+        self.transfer_button = QPushButton("창고이동 보드")
+        self.transfer_button.setEnabled(False)
         self.export_button = QPushButton("택배 출고용 변환")
         self.export_button.setObjectName("exportButton")
         self.export_button.setEnabled(False)
@@ -373,6 +694,7 @@ class MainWindow(QMainWindow):
         header_row.addWidget(title)
         header_row.addStretch(1)
         header_row.addWidget(self.db_button)
+        header_row.addWidget(self.transfer_button)
         layout.addLayout(header_row)
         layout.addWidget(subtitle)
         layout.addLayout(login_row)
@@ -390,6 +712,7 @@ class MainWindow(QMainWindow):
         self.b2b_button.clicked.connect(self.select_b2b_file)
         self.auto_button.clicked.connect(lambda: self.select_file("auto"))
         self.db_button.clicked.connect(self.open_db_manager)
+        self.transfer_button.clicked.connect(self.open_transfer_board)
         self.export_button.clicked.connect(self.export_file)
         self.table.cellDoubleClicked.connect(self.edit_match)
 
@@ -409,6 +732,7 @@ class MainWindow(QMainWindow):
         self.b2c_button.setEnabled(True)
         self.b2b_button.setEnabled(True)
         self.auto_button.setEnabled(True)
+        self.transfer_button.setEnabled(True)
         self.supabase_client = catalog["client"]
         self.catalog = catalog
         self.is_admin = catalog.get("app_role") == "admin"
@@ -425,6 +749,12 @@ class MainWindow(QMainWindow):
             return
         ItemManagerDialog(self.supabase_client, self.catalog["items"], self).exec()
         self.matcher = ProductMatcher(self.catalog["items"], self.catalog["products"], self.catalog["components"], self.catalog["aliases"])
+
+    def open_transfer_board(self) -> None:
+        if not self.catalog:
+            QMessageBox.warning(self, "로그인 필요", "먼저 로그인해 DB 정보를 불러와 주세요.")
+            return
+        EcountTransferDialog(self.catalog, self).exec()
 
     def on_failure(self, message: str) -> None:
         self.login_button.setEnabled(True)
