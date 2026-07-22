@@ -1,0 +1,36 @@
+{
+  "valid": true,
+  "source_file": "C:/Users/82104/OneDrive/Desktop/이카운트/위킵_이카운트_양식.xlsx",
+  "generated_at": "2026-07-22T05:15:12.445Z",
+  "counts": {
+    "ecount_item_reference.csv": 283,
+    "ecount_item_aliases.csv": 533,
+    "ecount_sales_channels.csv": 105,
+    "ecount_product_mappings.csv": 744,
+    "ecount_product_mapping_components.csv": 1359,
+    "ecount_price_rules.csv": 1608,
+    "ecount_price_rule_components.csv": 4007,
+    "ecount_migration_issues.csv": 48
+  },
+  "price_rule_statuses": {
+    "missing_item": 12,
+    "confirmed": 1567,
+    "zero_price_review": 15,
+    "amount_mismatch": 14
+  },
+  "issue_types": {
+    "item_alias_unusable": 1,
+    "item_alias_missing_code": 1,
+    "item_alias_conflict": 4,
+    "price_component_missing_item": 12,
+    "price_component_zero_price": 15,
+    "price_rule_amount_mismatch": 15
+  },
+  "checks": {
+    "product_mapping_component_codes_exist": true,
+    "price_source_rows_covered": true,
+    "price_source_row_count": 4007,
+    "covered_price_component_rows": 4007,
+    "structural_errors": []
+  }
+}
