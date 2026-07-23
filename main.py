@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.14"
+APP_VERSION = "1.0.15"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -845,6 +845,7 @@ class MainWindow(QMainWindow):
             QMainWindow, QWidget#mainContainer { background: #fbfaf7; color: #233653; font-family: '맑은 고딕'; font-size: 13px; }
             QLabel#appTitle { color: #172f52; font-size: 28px; font-weight: 800; }
             QLabel#appSubtitle { color: #718096; font-size: 13px; padding-left: 3px; }
+            QLabel#versionLabel { color: #9aa6b5; font-size: 10px; padding: 0 0 3px 4px; }
             QLabel#sectionTitle { color: #1f3657; font-size: 17px; font-weight: 750; padding: 5px 2px; }
             QLabel#statusCard { background: #f3f8ff; color: #315b80; border: 1px solid #cfe0f4; border-radius: 13px; padding: 14px 16px; }
             QFrame#loginCard, QFrame#fileCard, QFrame#locationCard { background: #ffffff; border: 1px solid #dce6f1; border-radius: 15px; }
@@ -858,7 +859,7 @@ class MainWindow(QMainWindow):
             QPushButton:disabled { background: #edf0f4; color: #9aa6b5; border-color: #e1e5eb; }
             QPushButton#primaryButton { background: #2f76d2; color: white; border: none; padding: 13px 22px; font-size: 14px; }
             QPushButton#primaryButton:hover { background: #2868bb; }
-            QPushButton#fileButton { background: #ffffff; color: #2568be; border: 1px solid #8db7e8; padding: 15px 24px; font-size: 16px; }
+            QPushButton#fileButton { background: #ffffff; color: #2568be; border: 1px solid #8db7e8; padding: 8px 14px; font-size: 13px; }
             QPushButton#fileButton:hover { background: #eaf3ff; }
             QPushButton#exportButton { background: #2878dc; color: white; border: none; padding: 14px 28px; font-size: 16px; }
             QPushButton#exportButton:hover { background: #2168c2; }
@@ -877,6 +878,8 @@ class MainWindow(QMainWindow):
 
         title = QLabel("📦  REQM 출고 관리")
         title.setObjectName("appTitle")
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setObjectName("versionLabel")
         subtitle = QLabel("주문 파일을 자동 분석하고 정확한 출고 데이터로 변환합니다")
         subtitle.setObjectName("appSubtitle")
         self.email = QLineEdit()
@@ -887,14 +890,15 @@ class MainWindow(QMainWindow):
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.login_button = QPushButton("로그인")
         self.login_button.setObjectName("primaryButton")
-        self.login_button.setMaximumWidth(100)
+        self.login_button.setFixedWidth(84)
         self.b2c_button = QPushButton("B2C 엑셀 파일 (셀메이트)")
         self.b2c_button.setEnabled(False)
         self.b2b_button = QPushButton("B2B 엑셀 파일 (면세점)")
         self.b2b_button.setEnabled(False)
         self.auto_button = QPushButton("📁  출고 작업 파일 선택")
         self.auto_button.setObjectName("fileButton")
-        self.auto_button.setMinimumHeight(64)
+        self.auto_button.setFixedHeight(38)
+        self.auto_button.setMaximumWidth(190)
         self.auto_button.setEnabled(False)
         self.db_button = QPushButton("▣  DB 관리")
         self.db_button.setObjectName("adminButton")
@@ -933,11 +937,19 @@ class MainWindow(QMainWindow):
         login_row = QHBoxLayout()
         login_row.setContentsMargins(14, 12, 14, 12)
         login_row.setSpacing(10)
+        self.email.setFixedWidth(300)
+        self.password.setFixedWidth(250)
         login_row.addWidget(self.email)
         login_row.addWidget(self.password)
         login_row.addWidget(self.login_button)
         self.header_row = QHBoxLayout()
-        self.header_row.addWidget(title)
+        title_line = QHBoxLayout()
+        title_line.setSpacing(2)
+        title_line.addWidget(title)
+        title_line.addWidget(version_label, 0, Qt.AlignmentFlag.AlignBottom)
+        title_block = QWidget()
+        title_block.setLayout(title_line)
+        self.header_row.addWidget(title_block)
         self.header_row.addStretch(1)
         self.header_row.addWidget(self.db_button)
         self.header_row.addWidget(self.update_button)
@@ -948,40 +960,47 @@ class MainWindow(QMainWindow):
         self.login_card = QFrame()
         self.login_card.setObjectName("loginCard")
         self.login_card.setLayout(login_row)
-        layout.addWidget(self.login_card)
+        self.login_card.setMaximumWidth(690)
+        layout.addWidget(self.login_card, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(self.status)
         file_card = QFrame()
         file_card.setObjectName("fileCard")
         file_layout = QVBoxLayout(file_card)
-        file_layout.setContentsMargins(18, 14, 18, 14)
+        file_layout.setContentsMargins(18, 14, 18, 16)
+        file_layout.setSpacing(10)
         file_label = QLabel("엑셀·CSV·PDF 파일의 양식과 품목을 자동으로 분석합니다")
         file_label.setObjectName("appSubtitle")
+        file_label.setWordWrap(True)
+        file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.order_drop_zone = FileDropZone(
-            label_text="📄  출고 파일을 여기에 드래그 앤 드롭하세요  ·  Excel / CSV / PDF",
+            label_text="📄\n파일을 이곳에\n드래그 앤 드롭\nExcel · CSV · PDF",
             allowed_suffixes={".xls", ".xlsx", ".csv", ".pdf"},
         )
-        self.order_drop_zone.setMinimumHeight(94)
+        self.order_drop_zone.setFixedSize(190, 190)
         self.order_drop_zone.filesDropped.connect(self.load_dropped_order_files)
         file_layout.addWidget(file_label)
-        file_layout.addWidget(self.order_drop_zone)
-        file_layout.addWidget(self.auto_button)
-        layout.addWidget(file_card)
+        file_layout.addWidget(self.auto_button, 0, Qt.AlignmentFlag.AlignCenter)
+        file_layout.addWidget(self.order_drop_zone, 0, Qt.AlignmentFlag.AlignCenter)
+        file_card.setFixedWidth(300)
+        layout.addWidget(file_card, 0, Qt.AlignmentFlag.AlignLeft)
         location_row = QHBoxLayout()
         location_row.setContentsMargins(16, 12, 16, 12)
         location_row.setSpacing(10)
         self.location_combo = QComboBox()
         self.location_combo.setPlaceholderText("면세점 출고지를 선택하세요")
+        self.location_combo.setFixedWidth(340)
         self.location_manage_button = QPushButton("출고지 정보 관리")
         self.location_apply_button = QPushButton("선택 출고지 적용")
         self.location_apply_button.setEnabled(False)
         location_row.addWidget(QLabel("📍  면세점 출고지"))
-        location_row.addWidget(self.location_combo, 1)
+        location_row.addWidget(self.location_combo)
         location_row.addWidget(self.location_manage_button)
         location_row.addWidget(self.location_apply_button)
         location_card = QFrame()
         location_card.setObjectName("locationCard")
         location_card.setLayout(location_row)
-        layout.addWidget(location_card)
+        location_card.setMaximumWidth(850)
+        layout.addWidget(location_card, 0, Qt.AlignmentFlag.AlignLeft)
         analysis_title = QLabel("▥  분석 결과")
         analysis_title.setObjectName("sectionTitle")
         layout.addWidget(analysis_title)
@@ -1016,8 +1035,6 @@ class MainWindow(QMainWindow):
         selected_index = -1
         for index, row in enumerate(self.duty_locations):
             label = row.get("name", "")
-            if row.get("channel"):
-                label += f" · {row['channel']}"
             self.location_combo.addItem(label, row.get("id", ""))
             if row.get("id") == selected_id:
                 selected_index = index

@@ -25,7 +25,7 @@ Supabase 비밀번호와 `service_role` 키는 GitHub에 커밋하지 마세요.
 ## 실행파일 빌드
 
 ```powershell
-pyinstaller --noconfirm --clean REQM_1_0_14.spec
+pyinstaller --noconfirm --clean REQM_1_0_15.spec
 ```
 
 ## 판매전표 반자동화 테스트 앱

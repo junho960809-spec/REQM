@@ -26,7 +26,7 @@
 - `duty_free_loader.py`: 면세점 Excel 및 바코드 분석
 - `matcher.py`: 출고 품목과 세트상품 매칭
 - `shipping_export.py`: 택배 출고 Excel 생성
-- `REQM_1_0_14.spec`: 통합 Windows EXE 빌드 설정
+- `REQM_1_0_15.spec`: 통합 Windows EXE 빌드 설정
 
 ## 권한
 
