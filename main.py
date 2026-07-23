@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.17"
+APP_VERSION = "1.0.18"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -747,6 +747,24 @@ def load_config() -> dict:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+def fetch_all_rows(client: Client, table: str, page_size: int = 1000) -> list[dict]:
+    """Load a Supabase table without silently truncating rows at the API page limit."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        response = (
+            client.table(table)
+            .select("*")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        page = response.data or []
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        start += page_size
+
+
 class LoginWorker(QThread):
     succeeded = Signal(int, object)
     failed = Signal(str)
@@ -765,29 +783,17 @@ class LoginWorker(QThread):
             auth_result = client.auth.sign_in_with_password(
                 {"email": self.email, "password": self.password}
             )
-            def fetch_all(table: str) -> list[dict]:
-                rows: list[dict] = []
-                start = 0
-                page_size = 1000
-                while True:
-                    response = client.table(table).select("*").range(start, start + page_size - 1).execute()
-                    page = response.data or []
-                    rows.extend(page)
-                    if len(page) < page_size:
-                        return rows
-                    start += page_size
-
-            items = fetch_all("items")
-            products = fetch_all("registered_products")
-            components = fetch_all("product_components")
-            barcodes = fetch_all("item_barcodes")
-            duty_locations = fetch_all("duty_free_locations")
+            items = fetch_all_rows(client, "items")
+            products = fetch_all_rows(client, "registered_products")
+            components = fetch_all_rows(client, "product_components")
+            barcodes = fetch_all_rows(client, "item_barcodes")
+            duty_locations = fetch_all_rows(client, "duty_free_locations")
             try:
-                aliases = fetch_all("item_aliases")
+                aliases = fetch_all_rows(client, "item_aliases")
             except Exception:
                 aliases = []
             try:
-                role_rows = fetch_all("app_user_roles")
+                role_rows = fetch_all_rows(client, "app_user_roles")
                 app_role = next((r.get("role") for r in role_rows if str(r.get("user_id")) == str(auth_result.user.id)), "viewer")
             except Exception:
                 app_role = "admin" if str(auth_result.user.id) == ADMIN_USER_ID else "viewer"
@@ -1268,16 +1274,6 @@ class MainWindow(QMainWindow):
 
     def reload_catalog_after_db_change(self) -> None:
         """관리 화면에서 변경된 Supabase 데이터를 즉시 다시 불러온다."""
-        def fetch_all(table: str) -> list[dict]:
-            rows: list[dict] = []
-            start = 0
-            while True:
-                page = self.supabase_client.table(table).select("*").range(start, start + 999).execute().data or []
-                rows.extend(page)
-                if len(page) < 1000:
-                    return rows
-                start += 1000
-
         try:
             for key, table in (
                 ("items", "items"),
@@ -1286,7 +1282,7 @@ class MainWindow(QMainWindow):
                 ("barcodes", "item_barcodes"),
                 ("aliases", "item_aliases"),
             ):
-                self.catalog[key] = fetch_all(table)
+                self.catalog[key] = fetch_all_rows(self.supabase_client, table)
             self.matcher = ProductMatcher(
                 self.catalog["items"], self.catalog["products"],
                 self.catalog["components"], self.catalog["aliases"],
