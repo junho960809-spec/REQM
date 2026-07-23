@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.15"
+APP_VERSION = "1.0.16"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -809,7 +809,10 @@ class FileDropZone(QFrame):
         self.allowed_suffixes = allowed_suffixes or {".xls", ".xlsx", ".pdf"}
         self.setAcceptDrops(True)
         self.setMinimumHeight(76)
-        self.setStyleSheet("QFrame { border: 2px dashed #9bbce5; border-radius: 10px; background: #f7fbff; }")
+        self.setStyleSheet(
+            "QFrame { border: 2px dashed #48bdb7; border-radius: 20px; "
+            "background: #e9f8f6; color: #172321; }"
+        )
         layout = QVBoxLayout(self)
         label = QLabel(label_text)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -842,41 +845,41 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("REQM 출고 관리")
         self.resize(1420, 860)
         self.setStyleSheet("""
-            QMainWindow, QWidget#mainContainer { background: #fbfaf7; color: #233653; font-family: '맑은 고딕'; font-size: 13px; }
-            QLabel#appTitle { color: #172f52; font-size: 28px; font-weight: 800; }
-            QLabel#appSubtitle { color: #718096; font-size: 13px; padding-left: 3px; }
-            QLabel#versionLabel { color: #9aa6b5; font-size: 10px; padding: 0 0 3px 4px; }
-            QLabel#sectionTitle { color: #1f3657; font-size: 17px; font-weight: 750; padding: 5px 2px; }
-            QLabel#statusCard { background: #f3f8ff; color: #315b80; border: 1px solid #cfe0f4; border-radius: 13px; padding: 14px 16px; }
-            QFrame#loginCard, QFrame#fileCard, QFrame#locationCard { background: #ffffff; border: 1px solid #dce6f1; border-radius: 15px; }
-            QFrame#fileCard { background: #f4f8ff; border: 1px dashed #9bbde8; }
-            QFrame#locationCard { background: #f8f5ff; border-color: #d9cff1; }
-            QLineEdit, QComboBox { background: white; border: 1px solid #d6e0eb; border-radius: 10px; padding: 10px 12px; selection-background-color: #3977d5; }
-            QLineEdit:focus, QComboBox:focus { border: 1px solid #4f8ddd; }
-            QPushButton { background: white; color: #29476b; border: 1px solid #cfdeed; border-radius: 10px; padding: 10px 16px; font-weight: 650; }
-            QPushButton:hover { background: #edf5ff; border-color: #8fb4e1; }
-            QPushButton:pressed { background: #dfeeff; }
-            QPushButton:disabled { background: #edf0f4; color: #9aa6b5; border-color: #e1e5eb; }
-            QPushButton#primaryButton { background: #2f76d2; color: white; border: none; padding: 13px 22px; font-size: 14px; }
-            QPushButton#primaryButton:hover { background: #2868bb; }
-            QPushButton#fileButton { background: #ffffff; color: #2568be; border: 1px solid #8db7e8; padding: 8px 14px; font-size: 13px; }
-            QPushButton#fileButton:hover { background: #eaf3ff; }
-            QPushButton#exportButton { background: #2878dc; color: white; border: none; padding: 14px 28px; font-size: 16px; }
-            QPushButton#exportButton:hover { background: #2168c2; }
-            QPushButton#adminButton { background: #f6faff; color: #275b91; border-color: #a9c7e8; padding: 9px 16px; }
-            QTableWidget { background: white; alternate-background-color: #fbfcfe; border: 1px solid #dce5ef; border-radius: 12px; gridline-color: #edf1f5; selection-background-color: #dcecff; selection-color: #172b4d; }
-            QHeaderView::section { background: #f4f7fb; color: #344b67; border: none; border-right: 1px solid #e3e9f0; border-bottom: 1px solid #d6e0ea; padding: 10px; font-weight: 700; }
-            QScrollBar:vertical { background: #edf2f7; width: 22px; margin: 2px; border-radius: 10px; }
-            QScrollBar::handle:vertical { background: #91a7c0; min-height: 48px; border-radius: 9px; margin: 2px; }
-            QScrollBar::handle:vertical:hover { background: #6f8eae; }
-            QScrollBar:horizontal { background: #edf2f7; height: 22px; margin: 2px; border-radius: 10px; }
-            QScrollBar::handle:horizontal { background: #91a7c0; min-width: 48px; border-radius: 9px; margin: 2px; }
-            QScrollBar::handle:horizontal:hover { background: #6f8eae; }
+            QMainWindow, QWidget#mainContainer { background: #f7f7f3; color: #151515; font-family: '맑은 고딕'; font-size: 13px; }
+            QLabel#appTitle { color: #111111; font-size: 30px; font-weight: 900; letter-spacing: -1px; }
+            QLabel#appSubtitle { color: #6f716f; font-size: 13px; padding-left: 3px; }
+            QLabel#versionLabel { color: #a3a5a2; font-size: 10px; padding: 0 0 4px 4px; }
+            QLabel#sectionTitle { color: #111111; font-size: 18px; font-weight: 850; padding: 7px 2px; }
+            QLabel#statusCard { background: #e3f6f3; color: #244945; border: none; border-radius: 17px; padding: 13px 17px; }
+            QFrame#loginCard, QFrame#fileCard, QFrame#locationCard { background: #ffffff; border: 1px solid #e3e3df; border-radius: 20px; }
+            QFrame#fileCard { background: #f0f0ed; border: none; }
+            QFrame#locationCard { background: #f7efe2; border: none; }
+            QLineEdit, QComboBox { background: #ffffff; color: #171717; border: 1px solid #d8d8d3; border-radius: 13px; padding: 10px 13px; selection-background-color: #5bcac2; selection-color: #111111; }
+            QLineEdit:focus, QComboBox:focus { border: 1px solid #38aaa3; }
+            QPushButton { background: #ffffff; color: #151515; border: 1px solid #cacac5; border-radius: 15px; padding: 10px 16px; font-weight: 700; }
+            QPushButton:hover { background: #e9f8f6; border-color: #48bdb7; }
+            QPushButton:pressed { background: #d6f0ed; }
+            QPushButton:disabled { background: #e9e9e5; color: #a6a7a4; border-color: #e1e1dc; }
+            QPushButton#primaryButton { background: #121212; color: #ffffff; border: none; padding: 13px 22px; font-size: 14px; }
+            QPushButton#primaryButton:hover { background: #2f6662; }
+            QPushButton#fileButton { background: #121212; color: #ffffff; border: none; padding: 8px 14px; font-size: 13px; }
+            QPushButton#fileButton:hover { background: #2f6662; }
+            QPushButton#exportButton { background: #121212; color: #ffffff; border: none; padding: 14px 28px; font-size: 16px; }
+            QPushButton#exportButton:hover { background: #2f6662; }
+            QPushButton#adminButton { background: #ffffff; color: #151515; border-color: #cfcfca; padding: 9px 16px; }
+            QTableWidget { background: #ffffff; alternate-background-color: #fafaf7; border: 1px solid #deded9; border-radius: 16px; gridline-color: #ecece8; selection-background-color: #d9f3f0; selection-color: #111111; }
+            QHeaderView::section { background: #ecece8; color: #1b1b1b; border: none; border-right: 1px solid #dadad5; border-bottom: 1px solid #d6d6d1; padding: 11px; font-weight: 800; }
+            QScrollBar:vertical { background: #ecece8; width: 22px; margin: 2px; border-radius: 10px; }
+            QScrollBar::handle:vertical { background: #8fc9c4; min-height: 48px; border-radius: 9px; margin: 2px; }
+            QScrollBar::handle:vertical:hover { background: #55aaa4; }
+            QScrollBar:horizontal { background: #ecece8; height: 22px; margin: 2px; border-radius: 10px; }
+            QScrollBar::handle:horizontal { background: #8fc9c4; min-width: 48px; border-radius: 9px; margin: 2px; }
+            QScrollBar::handle:horizontal:hover { background: #55aaa4; }
             QScrollBar::add-line, QScrollBar::sub-line { width: 0px; height: 0px; }
             QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
         """)
 
-        title = QLabel("📦  REQM 출고 관리")
+        title = QLabel("REQM  출고 관리")
         title.setObjectName("appTitle")
         version_label = QLabel(f"v{APP_VERSION}")
         version_label.setObjectName("versionLabel")
