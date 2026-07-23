@@ -1,9 +1,15 @@
 import unittest
 
+from PySide6.QtWidgets import QApplication
+
 from main import EcountTransferDialog
 
 
 class EcountLookupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
     def setUp(self):
         self.employees = [
             {"employee_code": "E001", "employee_name": "홍 길동"},
@@ -44,6 +50,39 @@ class EcountLookupTests(unittest.TestCase):
             "없는창고", self.warehouses, "warehouse_code", "warehouse_name"
         )
         self.assertEqual(code, "")
+
+    def test_missing_code_is_resolved_from_item_name(self):
+        dialog = EcountTransferDialog({
+            "items": [
+                {"item_code": "ITEM-01", "standard_name": "테스트 상품 블랙", "is_active": True},
+            ],
+            "products": [],
+            "components": [],
+            "employees": [],
+            "warehouses": [],
+            "app_role": "viewer",
+        })
+        rows = dialog.resolve_transfer_item_codes([
+            {"item_code": "", "item_name": "테스트 상품 블랙", "quantity": 3},
+        ])
+        dialog.close()
+        self.assertEqual(rows[0]["item_code"], "ITEM-01")
+        self.assertEqual(rows[0]["quantity"], 3)
+
+    def test_unknown_item_name_is_blocked(self):
+        dialog = EcountTransferDialog({
+            "items": [],
+            "products": [],
+            "components": [],
+            "employees": [],
+            "warehouses": [],
+            "app_role": "viewer",
+        })
+        with self.assertRaisesRegex(ValueError, "DB 코드를 확정하지 못했습니다"):
+            dialog.resolve_transfer_item_codes([
+                {"item_code": "", "item_name": "없는 품목", "quantity": 1},
+            ])
+        dialog.close()
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.9"
+APP_VERSION = "1.0.10"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -1167,10 +1167,61 @@ class EcountTransferDialog(QDialog):
                 quantity = float(qty_text.replace(",", ""))
             except ValueError:
                 raise ValueError(f"{row_index + 1}행 수량을 확인해 주세요.")
-            if not code or not name or quantity <= 0:
-                raise ValueError(f"{row_index + 1}행의 품목코드·품목명·수량을 확인해 주세요.")
+            if not name or quantity <= 0:
+                raise ValueError(f"{row_index + 1}행의 품목명·수량을 확인해 주세요.")
             result.append({"item_code": code, "item_name": name, "quantity": quantity})
         return result
+
+    def resolve_transfer_item_codes(self, rows: list[dict]) -> list[dict]:
+        items = [row for row in self.catalog.get("items", []) if row.get("is_active", True)]
+        products = self.catalog.get("products", [])
+        components = self.catalog.get("components", [])
+        item_by_code = {
+            str(item.get("item_code", "")).strip(): item
+            for item in items if str(item.get("item_code", "")).strip()
+        }
+        resolved: list[dict] = []
+        unresolved: list[str] = []
+        for index, row in enumerate(rows, start=1):
+            code = str(row.get("item_code", "")).strip()
+            name = str(row.get("item_name", "")).strip()
+            if code in item_by_code:
+                resolved.append({
+                    "item_code": code,
+                    "item_name": str(item_by_code[code].get("standard_name", name)),
+                    "quantity": float(row.get("quantity", 0)),
+                })
+                continue
+            matched = match_transfer_rows(
+                [{
+                    "source_row": str(index),
+                    "source_code": "",
+                    "source_name": name,
+                    "quantity": float(row.get("quantity", 0)),
+                }],
+                items,
+                products,
+                components,
+            )
+            valid = [entry for entry in matched if str(entry.get("item_code", "")).strip()]
+            if not valid or any(entry.get("status") in {"missing", "ambiguous"} for entry in matched):
+                unresolved.append(f"{index}행 · {name}")
+                continue
+            resolved.extend({
+                "item_code": str(entry.get("item_code", "")).strip(),
+                "item_name": str(entry.get("item_name", name)).strip(),
+                "quantity": float(entry.get("quantity", 0)),
+            } for entry in valid)
+        if unresolved:
+            examples = "\n".join(f"• {value}" for value in unresolved[:10])
+            if len(unresolved) > 10:
+                examples += f"\n• 외 {len(unresolved) - 10}개"
+            raise ValueError(
+                "다음 품목은 품목명으로 DB 코드를 확정하지 못했습니다.\n"
+                "창고이동 표에서 해당 품목을 더블클릭해 수동으로 연결해 주세요.\n\n"
+                + examples
+            )
+        return aggregate_transfer_rows(resolved)
 
     def submit_transfer(self):
         if not self.rows:
@@ -1191,7 +1242,7 @@ class EcountTransferDialog(QDialog):
         if not self.api_values.get("api_key", "").strip():
             QMessageBox.warning(self, "API 인증키", "오른쪽 위 정보 버튼을 눌러 이카운트 API 인증키를 입력해 주세요."); return
         try:
-            rows = self.rows_from_table()
+            rows = self.resolve_transfer_item_codes(self.rows_from_table())
         except Exception as exc:
             QMessageBox.warning(self, "품목 확인", str(exc)); return
         answer = QMessageBox.question(self, "실제 창고이동 등록", f"{len(rows)}개 품목을 이카운트에 실제 등록합니다.\n{from_code} → {to_code}\n계속할까요?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
