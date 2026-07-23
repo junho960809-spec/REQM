@@ -20,7 +20,6 @@ a = Analysis(
     binaries=runtime_binaries + pdf_binaries + miner_binaries,
     datas=pdf_datas + miner_datas + [
         ("assets/direct_conversion_reference.xlsx", "assets"),
-        ("assets/ecount_item_reference.xlsx", "assets"),
     ],
     hiddenimports=pdf_hidden + miner_hidden,
     hookspath=[],

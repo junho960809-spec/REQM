@@ -8,10 +8,6 @@
 - 품목명·품목코드 매칭과 유사/미등록 품목 표시 및 수동 수정
 - 합포장과 실제 중복 출고 구분
 - 관리자 전용 품목 DB 관리
-- 이카운트 창고이동 보드
-- Excel/PDF 품목 분석 및 이카운트 품목코드 매칭
-- 담당자·보내는 창고·받는 창고 선택 또는 코드 직접 입력
-- 이카운트 `SaveLocationTran` API 등록 전 최종 확인
 
 ## 실행 준비
 
@@ -20,7 +16,7 @@
 3. Python 3.11 이상에서 `pip install -r requirements.txt`를 실행합니다.
 4. `python main.py`로 실행합니다.
 
-이카운트 API 인증키는 프로그램 실행 중에만 입력하며 파일에 저장하지 않습니다. Supabase 비밀번호, `service_role` 키, 이카운트 API 인증키는 GitHub에 커밋하지 마세요.
+Supabase 비밀번호와 `service_role` 키는 GitHub에 커밋하지 마세요.
 
 ## AI 및 개발자 인수인계
 
@@ -29,7 +25,7 @@
 ## 실행파일 빌드
 
 ```powershell
-pyinstaller --noconfirm --clean REQM_1_0_13.spec
+pyinstaller --noconfirm --clean REQM_1_0_14.spec
 ```
 
 ## 판매전표 반자동화 테스트 앱
