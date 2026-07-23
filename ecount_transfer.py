@@ -238,3 +238,69 @@ class EcountClient:
             qty_text = str(int(quantity)) if quantity.is_integer() else str(quantity)
             payload["LocationTranList"].append({"BulkDatas": {"IO_DATE": io_date, "UPLOAD_SER_NO": str(index), "EMP_CD": employee_code, "WH_CD_F": from_code, "WH_CD_T": to_code, "PROD_CD": str(row["item_code"]), "PROD_DES": str(row.get("item_name", "")), "QTY": qty_text, "REMARKS": remarks}})
         return self._post(f"https://oapi{self.zone}.ecount.com/OAPI/V2/Others/SaveLocationTran?SESSION_ID={session_id}", payload)
+
+
+def _find_result_data(value: Any) -> dict:
+    """Find the ECOUNT result object even when the API wraps Data one level deeper."""
+    if isinstance(value, dict):
+        keys = {str(key).casefold() for key in value}
+        if keys.intersection({"successcnt", "failcnt", "resultdetails", "slipnos"}):
+            return value
+        for child in value.values():
+            found = _find_result_data(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_result_data(child)
+            if found:
+                return found
+    return {}
+
+
+def _error_text(value: Any) -> list[str]:
+    messages: list[str] = []
+    interesting = {
+        "error", "errors", "message", "messageko", "messagedetail",
+        "totalerror", "errormessage", "error_message", "description",
+    }
+
+    def walk(node: Any, parent_key: str = "") -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                key_text = str(key)
+                key_folded = key_text.casefold()
+                if key_folded in interesting and child not in (None, "", [], {}):
+                    if isinstance(child, (dict, list)):
+                        walk(child, key_text)
+                    else:
+                        messages.append(str(child).strip())
+                elif isinstance(child, (dict, list)):
+                    walk(child, key_text)
+        elif isinstance(node, list):
+            for child in node:
+                walk(child, parent_key)
+        elif parent_key.casefold() in interesting and node not in (None, ""):
+            messages.append(str(node).strip())
+
+    walk(value)
+    return list(dict.fromkeys(message for message in messages if message))
+
+
+def parse_location_transfer_result(result: dict) -> dict:
+    data = _find_result_data(result)
+    success = int(data.get("SuccessCnt") or data.get("SUCCESS_CNT") or 0)
+    fail = int(data.get("FailCnt") or data.get("FAIL_CNT") or 0)
+    slip_values = data.get("SlipNos") or data.get("SLIP_NOS") or []
+    if not isinstance(slip_values, list):
+        slip_values = [slip_values] if slip_values else []
+    details = _error_text(data.get("ResultDetails") or data.get("RESULT_DETAILS") or [])
+    details.extend(message for message in _error_text(result) if message not in details)
+    return {
+        "status": str(result.get("Status") or result.get("status") or ""),
+        "success": success,
+        "fail": fail,
+        "slips": [str(value) for value in slip_values if value not in (None, "")],
+        "details": details,
+        "recognized": bool(data),
+    }

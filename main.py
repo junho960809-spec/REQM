@@ -44,7 +44,13 @@ from matcher import compact
 from matcher import order_source_text
 from shipping_export import export_wekep
 from duty_free_loader import load_duty_free, match_barcodes
-from ecount_transfer import EcountClient, aggregate_transfer_rows, match_transfer_rows, read_transfer_file
+from ecount_transfer import (
+    EcountClient,
+    aggregate_transfer_rows,
+    match_transfer_rows,
+    parse_location_transfer_result,
+    read_transfer_file,
+)
 from ecount_reference import load_ecount_items
 from credential_store import delete_ecount_api_key, load_ecount_api_key, save_ecount_api_key
 from catalog_import import compare_catalog, load_item_catalog
@@ -63,7 +69,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.11"
+APP_VERSION = "1.0.12"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -1270,14 +1276,27 @@ class EcountTransferDialog(QDialog):
             client = EcountClient(self.api_values["com_code"], self.api_values["user_id"], self.api_values["api_key"], self.api_values["zone"])
             session_id = client.login()
             result = client.save_location_transfer(session_id, rows, self.io_date.date().toString("yyyyMMdd"), employee_code, from_code, to_code, self.remarks.text().strip())
-            data = result.get("Data") or {}
-            success, fail = int(data.get("SuccessCnt") or 0), int(data.get("FailCnt") or 0)
-            slips = ", ".join(str(value) for value in (data.get("SlipNos") or [])) or "없음"
-            details = "\n".join(str(row.get("TotalError", "")) for row in (data.get("ResultDetails") or []))
-            if result.get("Status") == "200" and fail == 0 and success > 0:
+            parsed = parse_location_transfer_result(result)
+            success, fail = parsed["success"], parsed["fail"]
+            slips = ", ".join(parsed["slips"]) or "없음"
+            details = "\n".join(parsed["details"])
+            if parsed["status"] == "200" and fail == 0 and success > 0:
                 QMessageBox.information(self, "등록 완료", f"성공 {success}건 / 실패 {fail}건\n전표번호: {slips}")
             else:
-                QMessageBox.warning(self, "등록 결과 확인", f"성공 {success}건 / 실패 {fail}건\n전표번호: {slips}\n{details}")
+                if not details:
+                    response_preview = json.dumps(result, ensure_ascii=False, indent=2)
+                    if len(response_preview) > 1800:
+                        response_preview = response_preview[:1800] + "\n…"
+                    details = (
+                        "이카운트가 처리 건수나 오류 문구를 반환하지 않았습니다.\n"
+                        f"응답 상태: {parsed['status'] or '없음'}\n\n"
+                        f"[이카운트 원본 응답]\n{response_preview}"
+                    )
+                QMessageBox.warning(
+                    self,
+                    "등록 결과 확인",
+                    f"성공 {success}건 / 실패 {fail}건\n전표번호: {slips}\n\n{details}",
+                )
         except Exception as exc:
             QMessageBox.critical(self, "이카운트 등록 실패", str(exc))
 
