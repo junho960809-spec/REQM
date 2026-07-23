@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.9"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -1742,14 +1742,24 @@ class MainWindow(QMainWindow):
                 if expected_type not in {"b2b", "auto"}:
                     raise ValueError("면세점 B2B 파일로 감지됐습니다. B2B 엑셀 파일 버튼을 사용하세요.")
                 orders, detected_type = duty_result
-                match_barcodes(orders, self.catalog.get("barcodes", []), self.catalog.get("items", []))
+                if all(order.get("match_method") == "name_or_code" for order in orders):
+                    for order in orders:
+                        order.update(self.matcher.match(order))
+                else:
+                    match_barcodes(orders, self.catalog.get("barcodes", []), self.catalog.get("items", []))
                 columns = {"duty_free": 1}
                 self.current_mode = "duty_free"
-                self.selected_location_name = ""
+                embedded_destination = bool(orders) and all(
+                    order.get("embedded_destination") and order.get("recipient") and order.get("address")
+                    for order in orders
+                )
+                self.selected_location_name = detected_type if embedded_destination else ""
                 self.refresh_location_combo(detected_type)
                 self.location_apply_button.setEnabled(True)
-                self.export_button.setText("면세점 출고용 변환")
-                self.export_button.setEnabled(False)
+                self.export_button.setText(
+                    "매장 출고용 변환" if detected_type.startswith("트래블메이트") else "면세점 출고용 변환"
+                )
+                self.export_button.setEnabled(embedded_destination)
             else:
                 if expected_type not in {"b2c", "auto"}:
                     raise ValueError("면세점 B2B 양식을 찾지 못했습니다. B2C 파일이라면 B2C 엑셀 파일 버튼을 사용하세요.")

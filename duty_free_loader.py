@@ -79,6 +79,76 @@ def load_duty_free(file_path: str) -> tuple[list[dict[str, str]], str] | None:
 
     for header_index, row in enumerate(rows[:15]):
         headers = {norm(value): index for index, value in enumerate(row) if value is not None}
+        tm_code = headers.get("tm상품코드")
+        tm_product = headers.get("tm상품명")
+        tm_qty = headers.get("발주수량")
+        tm_store = headers.get("매장명")
+        if tm_code is not None and tm_product is not None and tm_qty is not None and tm_store is not None:
+            order_date_match = re.search(r"발\s*주\s*일\s*:\s*([0-9.\\/-]+)", file_text)
+            order_date = order_date_match.group(1) if order_date_match else ""
+            store_details: dict[str, dict[str, str]] = {}
+            for info_row in rows[header_index + 1 :]:
+                first_text = next((clean(value) for value in info_row if clean(value)), "")
+                if not first_text.startswith("＊"):
+                    continue
+                store_label = first_text.lstrip("＊").strip()
+                values = [clean(value) for value in info_row if clean(value)]
+                address = next(
+                    (value for value in values if "시 " in value or "도 " in value or "공항로" in value or "터미널대로" in value),
+                    "",
+                )
+                phone = next((value for value in values if re.search(r"\d{2,3}-\d{3,4}-\d{4}", value)), "")
+                manager_match = re.search(r"([가-힣]{2,5}\s*매니저)", address)
+                recipient = manager_match.group(1).replace(" ", "") if manager_match else store_label
+                store_details[norm(store_label)] = {
+                    "recipient": recipient,
+                    "address": address,
+                    "phone": phone,
+                    "store_label": store_label,
+                }
+
+            result = []
+            for source_row, data in enumerate(rows[header_index + 1 :], start=header_index + 2):
+                product = clean(data[tm_product]) if tm_product < len(data) else ""
+                external_code = clean(data[tm_code]) if tm_code < len(data) else ""
+                quantity = clean(data[tm_qty]) if tm_qty < len(data) else ""
+                store = clean(data[tm_store]) if tm_store < len(data) else ""
+                try:
+                    numeric_quantity = float(quantity.replace(",", ""))
+                except ValueError:
+                    numeric_quantity = 0
+                if not product or numeric_quantity <= 0:
+                    continue
+                details = next(
+                    (
+                        value for key, value in store_details.items()
+                        if norm(store) and norm(store) in key
+                    ),
+                    {},
+                )
+                store_label = details.get("store_label") or store or "매장"
+                result.append({
+                    "source_row": str(source_row),
+                    "order_number": " ".join(filter(None, ["트래블메이트", store_label, order_date])),
+                    "channel": "트래블메이트",
+                    "product_name": product,
+                    "source_item_code": external_code,
+                    "options": "",
+                    "quantity": str(int(numeric_quantity)) if numeric_quantity.is_integer() else str(numeric_quantity),
+                    "recipient": details.get("recipient", store_label),
+                    "phone": details.get("phone", ""),
+                    "zipcode": "",
+                    "address": details.get("address", ""),
+                    "message": f"매장명: {store_label}",
+                    "matched_name": re.sub(r"^\s*\[리큐엠\]\s*", "", product).strip(),
+                    "external_code": external_code,
+                    "match_method": "name_or_code",
+                    "embedded_destination": bool(details.get("address")),
+                })
+            if result:
+                destination = result[0].get("message", "").replace("매장명: ", "")
+                return result, f"트래블메이트 {destination} 발주서"
+
         city_barcode = headers.get("바코드")
         city_product = headers.get("상품명")
         city_qty = headers.get("수량")
