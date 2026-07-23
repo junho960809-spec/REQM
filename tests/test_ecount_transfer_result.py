@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import unittest
 
-from ecount_transfer import parse_location_transfer_result
+from ecount_transfer import EcountClient, parse_location_transfer_result
 
 
 class EcountTransferResultTests(unittest.TestCase):
+    def test_direct_execution_compatible_host_and_encoded_session(self):
+        client = EcountClient("123456", "tester", "secret", "AB", "sboapi")
+        self.assertEqual(client._base_url(), "https://sboapiAB.ecount.com/OAPI/V2")
+
     def test_reads_standard_success_response(self):
         parsed = parse_location_transfer_result({
             "Status": "200",

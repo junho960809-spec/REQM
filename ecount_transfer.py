@@ -1,6 +1,7 @@
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -196,12 +197,32 @@ def aggregate_transfer_rows(rows: list[dict]) -> list[dict]:
 
 
 class EcountClient:
-    def __init__(self, com_code: str, user_id: str, api_cert_key: str, zone: str = "AB"):
+    def __init__(
+        self,
+        com_code: str,
+        user_id: str,
+        api_cert_key: str,
+        zone: str = "AB",
+        api_host: str = "oapi",
+    ):
         self.com_code, self.user_id, self.api_cert_key, self.zone = com_code, user_id, api_cert_key, zone
+        self.api_host = "sboapi" if str(api_host).casefold() == "sboapi" else "oapi"
+
+    def _base_url(self) -> str:
+        return f"https://{self.api_host}{self.zone}.ecount.com/OAPI/V2"
 
     @staticmethod
     def _post(url: str, payload: dict) -> dict:
-        request = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "REQM-ECOUNT/1.0",
+            },
+            method="POST",
+        )
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -225,7 +246,16 @@ class EcountClient:
         return ""
 
     def login(self) -> str:
-        result = self._post(f"https://oapi{self.zone}.ecount.com/OAPI/V2/OAPILogin", {"COM_CODE": self.com_code, "USER_ID": self.user_id, "API_CERT_KEY": self.api_cert_key, "LAN_TYPE": "ko-KR", "ZONE": self.zone})
+        result = self._post(
+            f"{self._base_url()}/OAPILogin",
+            {
+                "COM_CODE": self.com_code,
+                "USER_ID": self.user_id,
+                "API_CERT_KEY": self.api_cert_key,
+                "LAN_TYPE": "ko-KR",
+                "ZONE": self.zone,
+            },
+        )
         session_id = self._find_session(result)
         if not session_id:
             raise RuntimeError(f"이카운트 로그인 실패: {result.get('Error') or result.get('Errors') or result}")
@@ -237,7 +267,8 @@ class EcountClient:
             quantity = float(row["quantity"])
             qty_text = str(int(quantity)) if quantity.is_integer() else str(quantity)
             payload["LocationTranList"].append({"BulkDatas": {"IO_DATE": io_date, "UPLOAD_SER_NO": str(index), "EMP_CD": employee_code, "WH_CD_F": from_code, "WH_CD_T": to_code, "PROD_CD": str(row["item_code"]), "PROD_DES": str(row.get("item_name", "")), "QTY": qty_text, "REMARKS": remarks}})
-        return self._post(f"https://oapi{self.zone}.ecount.com/OAPI/V2/Others/SaveLocationTran?SESSION_ID={session_id}", payload)
+        query = urllib.parse.urlencode({"SESSION_ID": session_id})
+        return self._post(f"{self._base_url()}/Others/SaveLocationTran?{query}", payload)
 
 
 def _find_result_data(value: Any) -> dict:

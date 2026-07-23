@@ -67,9 +67,10 @@ DEFAULT_CONFIG = {
     "ecount_com_code": "304293",
     "ecount_user_id": "ororamobile",
     "ecount_zone": "AB",
+    "ecount_api_host": "sboapi",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.12"
+APP_VERSION = "1.0.13"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -957,6 +958,7 @@ class EcountTransferDialog(QDialog):
             "com_code": str(config.get("ecount_com_code", "304293")),
             "user_id": str(config.get("ecount_user_id", "ororamobile")),
             "zone": str(config.get("ecount_zone", "AB")),
+            "api_host": str(config.get("ecount_api_host", "sboapi")),
             "api_key": stored_api_key,
         }
         info_button = QPushButton("정보")
@@ -1022,6 +1024,11 @@ class EcountTransferDialog(QDialog):
         com_code = QLineEdit(self.api_values["com_code"])
         user_id = QLineEdit(self.api_values["user_id"])
         zone = QLineEdit(self.api_values["zone"])
+        api_host = QComboBox()
+        api_host.addItem("직접실행 호환 (sboapi)", "sboapi")
+        api_host.addItem("운영 서버 (oapi)", "oapi")
+        selected_host = api_host.findData(self.api_values.get("api_host", "sboapi"))
+        api_host.setCurrentIndex(max(0, selected_host))
         visible_key = self.api_values["api_key"] if self.is_admin else ("********" if self.api_values["api_key"] else "")
         api_key = QLineEdit(visible_key)
         api_key.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1030,10 +1037,12 @@ class EcountTransferDialog(QDialog):
         com_code.setReadOnly(not self.is_admin)
         user_id.setReadOnly(not self.is_admin)
         zone.setReadOnly(not self.is_admin)
+        api_host.setEnabled(self.is_admin)
         form = QFormLayout()
         form.addRow("로그인 코드", com_code)
         form.addRow("이카운트 ID", user_id)
         form.addRow("ZONE", zone)
+        form.addRow("API 서버", api_host)
         form.addRow("API 인증키", api_key)
         reveal = QCheckBox("API 인증키 표시 (관리자 전용)")
         persist = QCheckBox("이 PC의 현재 Windows 계정에 암호화 저장")
@@ -1107,6 +1116,7 @@ class EcountTransferDialog(QDialog):
                 "com_code": com_code.text().strip(),
                 "user_id": user_id.text().strip(),
                 "zone": zone.text().strip(),
+                "api_host": str(api_host.currentData()),
                 "api_key": key_value,
             })
 
@@ -1273,7 +1283,13 @@ class EcountTransferDialog(QDialog):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            client = EcountClient(self.api_values["com_code"], self.api_values["user_id"], self.api_values["api_key"], self.api_values["zone"])
+            client = EcountClient(
+                self.api_values["com_code"],
+                self.api_values["user_id"],
+                self.api_values["api_key"],
+                self.api_values["zone"],
+                self.api_values.get("api_host", "sboapi"),
+            )
             session_id = client.login()
             result = client.save_location_transfer(session_id, rows, self.io_date.date().toString("yyyyMMdd"), employee_code, from_code, to_code, self.remarks.text().strip())
             parsed = parse_location_transfer_result(result)
