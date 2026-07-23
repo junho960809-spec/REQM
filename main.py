@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QDateEdit,
@@ -44,6 +45,7 @@ from matcher import order_source_text
 from shipping_export import export_wekep
 from duty_free_loader import load_duty_free, match_barcodes
 from ecount_transfer import EcountClient, aggregate_transfer_rows, match_transfer_rows, read_transfer_file
+from credential_store import delete_ecount_api_key, load_ecount_api_key, save_ecount_api_key
 from catalog_import import compare_catalog, load_item_catalog
 from location_store import load_locations, save_locations
 from format_store import upsert_format
@@ -60,7 +62,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -896,6 +898,7 @@ class EcountTransferDialog(QDialog):
     def __init__(self, catalog: dict, parent=None):
         super().__init__(parent)
         self.catalog = catalog
+        self.is_admin = catalog.get("app_role") == "admin"
         self.rows = []
         self.setWindowTitle("이카운트 창고이동 보드")
         self.resize(1120, 720)
@@ -936,11 +939,16 @@ class EcountTransferDialog(QDialog):
         self.table.cellDoubleClicked.connect(self.edit_transfer_item)
 
         config = load_config()
+        try:
+            stored_api_key = load_ecount_api_key()
+        except Exception:
+            stored_api_key = ""
+        self.api_key_is_stored = bool(stored_api_key)
         self.api_values = {
             "com_code": str(config.get("ecount_com_code", "304293")),
             "user_id": str(config.get("ecount_user_id", "ororamobile")),
             "zone": str(config.get("ecount_zone", "AB")),
-            "api_key": "",
+            "api_key": stored_api_key,
         }
         info_button = QPushButton("정보")
         info_button.setMaximumWidth(64)
@@ -990,19 +998,93 @@ class EcountTransferDialog(QDialog):
         com_code = QLineEdit(self.api_values["com_code"])
         user_id = QLineEdit(self.api_values["user_id"])
         zone = QLineEdit(self.api_values["zone"])
-        api_key = QLineEdit(self.api_values["api_key"])
+        visible_key = self.api_values["api_key"] if self.is_admin else ("********" if self.api_values["api_key"] else "")
+        api_key = QLineEdit(visible_key)
         api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        api_key.setPlaceholderText("API 인증키 (프로그램 종료 시 삭제)")
+        api_key.setPlaceholderText("API 인증키")
+        api_key.setReadOnly(not self.is_admin)
+        com_code.setReadOnly(not self.is_admin)
+        user_id.setReadOnly(not self.is_admin)
+        zone.setReadOnly(not self.is_admin)
         form = QFormLayout()
         form.addRow("로그인 코드", com_code)
         form.addRow("이카운트 ID", user_id)
         form.addRow("ZONE", zone)
         form.addRow("API 인증키", api_key)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
-        layout = QVBoxLayout(dialog); layout.addLayout(form); layout.addWidget(buttons)
-        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.api_values.update({"com_code": com_code.text().strip(), "user_id": user_id.text().strip(), "zone": zone.text().strip(), "api_key": api_key.text().strip()})
+        reveal = QCheckBox("API 인증키 표시 (관리자 전용)")
+        persist = QCheckBox("이 PC의 현재 Windows 계정에 암호화 저장")
+        persist.setChecked(self.api_key_is_stored)
+        delete_button = QPushButton("저장된 인증키 삭제")
+        reveal.setVisible(self.is_admin)
+        persist.setVisible(self.is_admin)
+        delete_button.setVisible(self.is_admin)
+        status = QLabel(
+            "암호화된 API 인증키가 저장되어 있습니다. 일반 사용자는 내용을 확인할 수 없습니다."
+            if self.api_key_is_stored else "저장된 API 인증키가 없습니다."
+        )
+        status.setWordWrap(True)
+        reveal.toggled.connect(
+            lambda checked: api_key.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+            if self.is_admin else QDialogButtonBox.StandardButton.Close
+        )
+        layout = QVBoxLayout(dialog)
+        layout.addLayout(form)
+        layout.addWidget(status)
+        layout.addWidget(reveal)
+        layout.addWidget(persist)
+        layout.addWidget(delete_button)
+        layout.addWidget(buttons)
+
+        def remove_saved_key() -> None:
+            answer = QMessageBox.question(
+                dialog, "API 인증키 삭제",
+                "이 PC에 암호화 저장된 이카운트 API 인증키를 삭제할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            delete_ecount_api_key()
+            self.api_values["api_key"] = ""
+            self.api_key_is_stored = False
+            api_key.clear()
+            persist.setChecked(False)
+            status.setText("저장된 API 인증키를 삭제했습니다.")
+
+        delete_button.clicked.connect(remove_saved_key)
+        if self.is_admin:
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+        else:
+            buttons.rejected.connect(dialog.reject)
+            buttons.clicked.connect(dialog.reject)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted and self.is_admin:
+            key_value = api_key.text().strip()
+            if not key_value:
+                QMessageBox.warning(self, "API 인증키", "API 인증키를 입력해 주세요.")
+                return
+            try:
+                if persist.isChecked():
+                    save_ecount_api_key(key_value)
+                    self.api_key_is_stored = True
+                else:
+                    delete_ecount_api_key()
+                    self.api_key_is_stored = False
+            except Exception as exc:
+                QMessageBox.critical(self, "API 인증키 저장 실패", f"Windows 암호화 저장에 실패했습니다.\n\n{exc}")
+                return
+            self.api_values.update({
+                "com_code": com_code.text().strip(),
+                "user_id": user_id.text().strip(),
+                "zone": zone.text().strip(),
+                "api_key": key_value,
+            })
 
     def edit_transfer_item(self, row_index: int, column_index: int):
         if row_index < 0 or column_index not in {3, 4}:
