@@ -62,6 +62,9 @@ class EcountLookupTests(unittest.TestCase):
             "warehouses": [],
             "app_role": "viewer",
         })
+        dialog.ecount_items = [
+            {"item_code": "ITEM-01", "standard_name": "테스트 상품 블랙", "is_active": True},
+        ]
         rows = dialog.resolve_transfer_item_codes([
             {"item_code": "", "item_name": "테스트 상품 블랙", "quantity": 3},
         ])
@@ -78,11 +81,34 @@ class EcountLookupTests(unittest.TestCase):
             "warehouses": [],
             "app_role": "viewer",
         })
-        with self.assertRaisesRegex(ValueError, "DB 코드를 확정하지 못했습니다"):
+        dialog.ecount_items = [
+            {"item_code": "ITEM-01", "standard_name": "다른 품목", "is_active": True},
+        ]
+        with self.assertRaisesRegex(ValueError, "이카운트 코드를 확정하지 못했습니다"):
             dialog.resolve_transfer_item_codes([
                 {"item_code": "", "item_name": "없는 품목", "quantity": 1},
             ])
         dialog.close()
+
+    def test_qp1000c_black_resolves_to_ecount_qp1000c1_code(self):
+        dialog = EcountTransferDialog({
+            "items": [],
+            "products": [],
+            "components": [],
+            "employees": [],
+            "warehouses": [],
+            "app_role": "viewer",
+        })
+        rows = dialog.resolve_transfer_item_codes([
+            {
+                "item_code": "",
+                "item_name": "10000mAh 보조배터리 QP1000C - 블랙",
+                "quantity": 2,
+            },
+        ])
+        dialog.close()
+        self.assertEqual(rows[0]["item_code"], "[RQM]-QP1000C1-BK")
+        self.assertEqual(rows[0]["item_name"], "[리큐엠] 보조배터리 QP1000C1 블랙")
 
 
 if __name__ == "__main__":

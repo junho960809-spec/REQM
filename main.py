@@ -45,6 +45,7 @@ from matcher import order_source_text
 from shipping_export import export_wekep
 from duty_free_loader import load_duty_free, match_barcodes
 from ecount_transfer import EcountClient, aggregate_transfer_rows, match_transfer_rows, read_transfer_file
+from ecount_reference import load_ecount_items
 from credential_store import delete_ecount_api_key, load_ecount_api_key, save_ecount_api_key
 from catalog_import import compare_catalog, load_item_catalog
 from location_store import load_locations, save_locations
@@ -62,7 +63,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.10"
+APP_VERSION = "1.0.11"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -900,6 +901,7 @@ class EcountTransferDialog(QDialog):
         super().__init__(parent)
         self.catalog = catalog
         self.is_admin = catalog.get("app_role") == "admin"
+        self.ecount_items = load_ecount_items()
         self.rows = []
         self.setWindowTitle("이카운트 창고이동 보드")
         self.resize(1120, 720)
@@ -1173,11 +1175,11 @@ class EcountTransferDialog(QDialog):
         return result
 
     def resolve_transfer_item_codes(self, rows: list[dict]) -> list[dict]:
-        items = [row for row in self.catalog.get("items", []) if row.get("is_active", True)]
-        products = self.catalog.get("products", [])
-        components = self.catalog.get("components", [])
+        items = self.ecount_items
+        if not items:
+            raise ValueError("이카운트 품목코드 기준표를 불러오지 못했습니다. 최신 프로그램으로 업데이트해 주세요.")
         item_by_code = {
-            str(item.get("item_code", "")).strip(): item
+            str(item.get("item_code", "")).strip().casefold(): item
             for item in items if str(item.get("item_code", "")).strip()
         }
         resolved: list[dict] = []
@@ -1185,10 +1187,12 @@ class EcountTransferDialog(QDialog):
         for index, row in enumerate(rows, start=1):
             code = str(row.get("item_code", "")).strip()
             name = str(row.get("item_name", "")).strip()
-            if code in item_by_code:
+            code_key = code.casefold()
+            if code_key in item_by_code:
+                canonical = item_by_code[code_key]
                 resolved.append({
-                    "item_code": code,
-                    "item_name": str(item_by_code[code].get("standard_name", name)),
+                    "item_code": str(canonical.get("item_code", code)),
+                    "item_name": str(canonical.get("standard_name", name)),
                     "quantity": float(row.get("quantity", 0)),
                 })
                 continue
@@ -1200,8 +1204,8 @@ class EcountTransferDialog(QDialog):
                     "quantity": float(row.get("quantity", 0)),
                 }],
                 items,
-                products,
-                components,
+                [],
+                [],
             )
             valid = [entry for entry in matched if str(entry.get("item_code", "")).strip()]
             if not valid or any(entry.get("status") in {"missing", "ambiguous"} for entry in matched):
@@ -1217,7 +1221,7 @@ class EcountTransferDialog(QDialog):
             if len(unresolved) > 10:
                 examples += f"\n• 외 {len(unresolved) - 10}개"
             raise ValueError(
-                "다음 품목은 품목명으로 DB 코드를 확정하지 못했습니다.\n"
+                "다음 품목은 품목명으로 이카운트 코드를 확정하지 못했습니다.\n"
                 "창고이동 표에서 해당 품목을 더블클릭해 수동으로 연결해 주세요.\n\n"
                 + examples
             )
@@ -1245,7 +1249,21 @@ class EcountTransferDialog(QDialog):
             rows = self.resolve_transfer_item_codes(self.rows_from_table())
         except Exception as exc:
             QMessageBox.warning(self, "품목 확인", str(exc)); return
-        answer = QMessageBox.question(self, "실제 창고이동 등록", f"{len(rows)}개 품목을 이카운트에 실제 등록합니다.\n{from_code} → {to_code}\n계속할까요?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        preview = "\n".join(
+            f"• {row['item_code']} | {row['item_name']} × {row['quantity']:g}"
+            for row in rows[:10]
+        )
+        if len(rows) > 10:
+            preview += f"\n• 외 {len(rows) - 10}개"
+        answer = QMessageBox.question(
+            self,
+            "실제 창고이동 등록",
+            f"{len(rows)}개 품목을 이카운트에 실제 등록합니다.\n"
+            f"{from_code} → {to_code}\n\n"
+            f"[이카운트 적용 품목코드]\n{preview}\n\n계속할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:

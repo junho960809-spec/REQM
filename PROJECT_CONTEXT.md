@@ -28,7 +28,7 @@
 - `matcher.py`: 출고 품목과 세트상품 매칭
 - `ecount_transfer.py`: 창고이동 파일 분석, 품목 매칭, 이카운트 API
 - `shipping_export.py`: 택배 출고 Excel 생성
-- `REQM_1_0_10.spec`: 통합 Windows EXE 빌드 설정
+- `REQM_1_0_11.spec`: 통합 Windows EXE 빌드 설정
 
 ## 권한
 
