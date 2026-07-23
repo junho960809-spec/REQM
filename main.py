@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -907,9 +907,9 @@ class EcountTransferDialog(QDialog):
         self.io_date.setCalendarPopup(True)
         self.io_date.setDisplayFormat("yyyy-MM-dd")
         self.io_date.lineEdit().setReadOnly(True)
-        self.employee = LookupLineEdit(); self.employee.setPlaceholderText("엔터/더블클릭으로 담당자 선택 또는 코드 직접 입력")
-        self.from_warehouse = LookupLineEdit(); self.from_warehouse.setPlaceholderText("엔터/더블클릭으로 보내는 창고 선택 또는 코드 직접 입력")
-        self.to_warehouse = LookupLineEdit(); self.to_warehouse.setPlaceholderText("엔터/더블클릭으로 받는 창고 선택 또는 코드 직접 입력")
+        self.employee = LookupLineEdit(); self.employee.setPlaceholderText("담당자 코드 또는 이름 입력 · 엔터로 검색")
+        self.from_warehouse = LookupLineEdit(); self.from_warehouse.setPlaceholderText("보내는 창고 코드 또는 창고명 입력 · 엔터로 검색")
+        self.to_warehouse = LookupLineEdit(); self.to_warehouse.setPlaceholderText("받는 창고 코드 또는 창고명 입력 · 엔터로 검색")
         self.remarks = QLineEdit("출고 프로그램 창고이동")
         self.employee.lookupRequested.connect(self.choose_employee)
         self.from_warehouse.lookupRequested.connect(lambda: self.choose_warehouse(self.from_warehouse, "보내는 창고 선택"))
@@ -984,12 +984,27 @@ class EcountTransferDialog(QDialog):
         text = target.text().strip()
         if not text or "|" in text:
             return
-        matched = next((row for row in rows if str(row.get(code_key, "")).strip() == text), None)
-        if matched:
+        matches = EcountTransferDialog._lookup_matches(text, rows, code_key, name_key)
+        if len(matches) == 1:
+            matched = matches[0]
             target.blockSignals(True)
             target.setText(f"{matched.get(code_key, '')} | {matched.get(name_key, '')}")
             target.setCursorPosition(len(target.text()))
             target.blockSignals(False)
+
+    @staticmethod
+    def _lookup_key(value: object) -> str:
+        return "".join(str(value or "").split()).casefold()
+
+    @staticmethod
+    def _lookup_matches(value: str, rows: list[dict], code_key: str, name_key: str) -> list[dict]:
+        lookup = EcountTransferDialog._lookup_key(value)
+        if not lookup:
+            return []
+        code_matches = [row for row in rows if EcountTransferDialog._lookup_key(row.get(code_key)) == lookup]
+        if code_matches:
+            return code_matches[:1]
+        return [row for row in rows if EcountTransferDialog._lookup_key(row.get(name_key)) == lookup]
 
     def show_api_info(self):
         dialog = QDialog(self)
@@ -1135,11 +1150,11 @@ class EcountTransferDialog(QDialog):
     def _code_from_input(value: str, rows: list[dict], code_key: str, name_key: str) -> str:
         text = value.strip()
         if "|" in text:
-            return text.split("|", 1)[0].strip()
-        for row in rows:
-            if text in {str(row.get(code_key, "")).strip(), str(row.get(name_key, "")).strip()}:
-                return str(row.get(code_key, "")).strip()
-        return text
+            text = text.split("|", 1)[0].strip()
+        matches = EcountTransferDialog._lookup_matches(text, rows, code_key, name_key)
+        if len(matches) != 1:
+            return ""
+        return str(matches[0].get(code_key, "")).strip()
 
     def rows_from_table(self) -> list[dict]:
         result = []
@@ -1164,7 +1179,12 @@ class EcountTransferDialog(QDialog):
         from_code = self._code_from_input(self.from_warehouse.text(), warehouses, "warehouse_code", "warehouse_name")
         to_code = self._code_from_input(self.to_warehouse.text(), warehouses, "warehouse_code", "warehouse_name")
         if not employee_code or not from_code or not to_code:
-            QMessageBox.warning(self, "필수값", "담당자, 보내는 창고, 받는 창고를 입력해 주세요."); return
+            QMessageBox.warning(
+                self,
+                "담당자·창고 확인",
+                "담당자와 창고를 등록된 코드 또는 정확한 이름으로 입력해 주세요.\n"
+                "같은 이름이 여러 개라면 입력창에서 엔터를 눌러 목록에서 선택해 주세요.",
+            ); return
         if from_code == to_code:
             QMessageBox.warning(self, "창고 확인", "보내는 창고와 받는 창고는 달라야 합니다."); return
         if not self.api_values.get("api_key", "").strip():
