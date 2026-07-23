@@ -29,7 +29,7 @@
 ## 실행파일 빌드
 
 ```powershell
-pyinstaller --noconfirm --clean REQM_1_0_7.spec
+pyinstaller --noconfirm --clean REQM_1_0_8.spec
 ```
 
 ## 판매전표 반자동화 테스트 앱

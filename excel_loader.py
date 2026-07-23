@@ -20,6 +20,7 @@ COLUMN_ALIASES = {
     "message": ["상세요구사항", "배송메세지", "배송메시지", "배송메시지2(한줄로)", "고객메시지"],
     "phone": ["수령자휴대폰", "핸드폰", "휴대폰", "연락처", "수령인핸드폰번호", "수령인 핸드폰", "인수자 HP"],
     "product_name": ["판매처상품명", "상품명", "품목명", "주문상품명(기간할인 제목+버전)"],
+    "item_code": ["품목코드", "상품코드", "제품코드", "재고코드", "협력사상품코드", "SKU", "PROD_CD", "ITEM CODE"],
     "option1": ["상품옵션", "옵션", "속성명"],
     "option2": ["상품옵션2", "옵션2"],
     "option3": ["상품옵션3", "옵션3"],
@@ -57,7 +58,26 @@ def _read_rows(path: Path) -> list[list[Any]]:
                     return list(csv.reader(handle))
             except UnicodeDecodeError:
                 continue
-    raise ValueError("지원 형식은 .xls, .xlsx, .csv입니다.")
+    if suffix == ".pdf":
+        try:
+            import pdfplumber
+        except ImportError as exc:
+            raise RuntimeError("PDF 분석 모듈이 없습니다. 최신 프로그램으로 업데이트해 주세요.") from exc
+        rows: list[list[Any]] = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                tables = page.extract_tables() or []
+                for table in tables:
+                    rows.extend([list(row) for row in table if row])
+                if not tables:
+                    for line in (page.extract_text() or "").splitlines():
+                        cells = [part.strip() for part in re.split(r"\s{2,}|\t", line) if part.strip()]
+                        if cells:
+                            rows.append(cells)
+        if not rows:
+            raise ValueError("PDF에서 표 또는 텍스트를 추출하지 못했습니다. 이미지 PDF라면 OCR 처리가 필요합니다.")
+        return rows
+    raise ValueError("지원 형식은 .xls, .xlsx, .csv, .pdf입니다.")
 
 
 def _normalize_header(value: Any) -> str:
@@ -203,6 +223,7 @@ def load_orders(file_path: str, profile: dict[str, Any] | None = None) -> tuple[
                 "channel": channel,
                 "source_format": format_name,
                 "product_name": product_name,
+                "source_item_code": get("item_code"),
                 "options": options,
                 "model": model,
                 "quantity": get("quantity"),

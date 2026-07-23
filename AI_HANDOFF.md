@@ -11,7 +11,7 @@
 
 ## 현재 기준 상태
 
-- 기준 버전: 1.0.7
+- 기준 버전: 1.0.8
 - 작업 브랜치: `agent/ecount-transfer-integrated-1.0.5`
 - 기본 브랜치: `main`
 - GUI: Python + PySide6

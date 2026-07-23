@@ -62,7 +62,7 @@ DEFAULT_CONFIG = {
     "ecount_zone": "AB",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -870,19 +870,20 @@ class LookupDialog(QDialog):
 class FileDropZone(QFrame):
     filesDropped = Signal(list)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, label_text: str = "엑셀 또는 PDF 파일을 여기에 드래그 앤 드롭하세요", allowed_suffixes: set[str] | None = None):
         super().__init__(parent)
+        self.allowed_suffixes = allowed_suffixes or {".xls", ".xlsx", ".pdf"}
         self.setAcceptDrops(True)
         self.setMinimumHeight(76)
         self.setStyleSheet("QFrame { border: 2px dashed #9bbce5; border-radius: 10px; background: #f7fbff; }")
         layout = QVBoxLayout(self)
-        label = QLabel("엑셀 또는 PDF 파일을 여기에 드래그 앤 드롭하세요")
+        label = QLabel(label_text)
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label)
 
     def dragEnterEvent(self, event):
         paths = [url.toLocalFile() for url in event.mimeData().urls()]
-        if paths and all(Path(path).suffix.lower() in {".xls", ".xlsx", ".pdf"} for path in paths):
+        if paths and all(Path(path).suffix.lower() in self.allowed_suffixes for path in paths):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
@@ -1303,7 +1304,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget()
         headers = [
-            "상태", "DB 대조 상품", "출고 품목코드", "판정 이유", "원본행", "주문번호",
+            "상태", "DB 대조 상품", "출고 품목코드", "판정 이유", "원본행", "원본 품목코드", "주문번호",
             "판매처", "상품명", "옵션", "수량", "수령인", "연락처", "우편번호", "주소", "재고매칭",
         ]
         self.table.setColumnCount(len(headers))
@@ -1341,11 +1342,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status)
         file_card = QFrame()
         file_card.setObjectName("fileCard")
-        file_layout = QHBoxLayout(file_card)
+        file_layout = QVBoxLayout(file_card)
         file_layout.setContentsMargins(18, 14, 18, 14)
-        file_label = QLabel("엑셀 파일을 선택하면 양식과 품목을 자동으로 분석합니다")
+        file_label = QLabel("엑셀·CSV·PDF 파일의 양식과 품목을 자동으로 분석합니다")
         file_label.setObjectName("appSubtitle")
-        file_layout.addWidget(file_label, 1)
+        self.order_drop_zone = FileDropZone(
+            label_text="📄  출고 파일을 여기에 드래그 앤 드롭하세요  ·  Excel / CSV / PDF",
+            allowed_suffixes={".xls", ".xlsx", ".csv", ".pdf"},
+        )
+        self.order_drop_zone.setMinimumHeight(94)
+        self.order_drop_zone.filesDropped.connect(self.load_dropped_order_files)
+        file_layout.addWidget(file_label)
+        file_layout.addWidget(self.order_drop_zone)
         file_layout.addWidget(self.auto_button)
         layout.addWidget(file_card)
         location_row = QHBoxLayout()
@@ -1707,15 +1715,25 @@ class MainWindow(QMainWindow):
         self.select_file("b2b")
 
     def select_file(self, expected_type: str) -> None:
-        title = "출고 Excel 파일 자동 판별" if expected_type == "auto" else ("B2C 셀메이트 주문 파일 선택" if expected_type == "b2c" else "B2B 면세점 출고 요청 파일 선택")
+        title = "출고 파일 자동 판별" if expected_type == "auto" else ("B2C 셀메이트 주문 파일 선택" if expected_type == "b2c" else "B2B 면세점 출고 요청 파일 선택")
         path, _ = QFileDialog.getOpenFileName(
             self,
             title,
             "",
-            "Excel/CSV 파일 (*.xls *.xlsx *.csv)",
+            "출고 파일 (*.xls *.xlsx *.csv *.pdf)",
         )
         if not path:
             return
+        self.load_order_file(path, expected_type)
+
+    def load_dropped_order_files(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        if len(paths) > 1:
+            QMessageBox.information(self, "파일 한 개씩 처리", "출고 파일은 한 번에 한 개씩 분석합니다. 첫 번째 파일을 불러옵니다.")
+        self.load_order_file(paths[0], "auto")
+
+    def load_order_file(self, path: str, expected_type: str = "auto") -> None:
         try:
             if self.matcher is None:
                 raise RuntimeError("먼저 Supabase에 로그인해 DB를 불러오세요.")
@@ -1746,6 +1764,17 @@ class MainWindow(QMainWindow):
                     orders, columns = load_orders(path, format_dialog.profile)
                 for order in orders:
                     order.update(self.matcher.match(order))
+                    if Path(path).suffix.lower() == ".pdf":
+                        missing_shipping = [
+                            label for key, label in (("order_number", "주문번호"), ("recipient", "수령인"))
+                            if not str(order.get(key, "")).strip()
+                        ]
+                        if missing_shipping:
+                            order["status"] = "missing"
+                            order["reason"] = (
+                                "PDF 필수 출고 정보 누락: " + ", ".join(missing_shipping)
+                                + " · 원본 PDF 표의 열 제목을 확인하세요 | " + order.get("reason", "")
+                            )
                     if order.get("manual_input_detected"):
                         order["status"] = "similar"
                         order["reason"] = "재고매칭 표준 열 뒤 수기 추가 품목 감지 · 검토 필요 | " + order.get("reason", "")
@@ -1857,7 +1886,7 @@ class MainWindow(QMainWindow):
 
     def populate_table(self, orders: list[dict[str, str]]) -> None:
         keys = [
-            "status", "matched_product", "components", "reason", "source_row", "order_number",
+            "status", "matched_product", "components", "reason", "source_row", "source_item_code", "order_number",
             "channel", "product_name", "options", "quantity", "recipient", "phone", "zipcode",
             "address", "matched_name",
         ]

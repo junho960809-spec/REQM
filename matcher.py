@@ -30,8 +30,12 @@ class ProductMatcher:
         for row in components:
             self.components_by_product[str(row.get("registered_product_id", ""))].append(row)
         self.items_by_exact: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.items_by_code: dict[str, dict[str, Any]] = {}
         for item in self.items:
             self.items_by_exact[compact(str(item.get("standard_name", "")))].append(item)
+            item_code = str(item.get("item_code", "")).strip()
+            if item_code:
+                self.items_by_code[item_code.casefold()] = item
         self.products_by_exact: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for product in self.products:
             key = compact(str(product.get("normalized_name") or product.get("original_name", "")))
@@ -82,6 +86,16 @@ class ProductMatcher:
         return "similar", [candidates[0][1]], f"유사 품목 일치 {top_score:.0%}"
 
     def match(self, order: dict[str, str]) -> dict[str, str]:
+        source_item_code = str(order.get("source_item_code", "")).strip()
+        if source_item_code:
+            item = self.items_by_code.get(source_item_code.casefold())
+            if item:
+                return {
+                    "status": "exact",
+                    "matched_product": str(item.get("standard_name", "")),
+                    "components": str(item.get("item_code", "")),
+                    "reason": "파일 품목코드 DB 정확 일치",
+                }
         alias_key = compact(order_source_text(order))
         alias = self.aliases.get((order.get("channel", ""), alias_key)) or self.aliases.get(("", alias_key))
         if alias:
@@ -147,7 +161,10 @@ class ProductMatcher:
                 scored.append((score, product))
         scored.sort(key=lambda x: x[0], reverse=True)
         if not scored:
-            return {"status": "missing", "matched_product": "", "components": "", "reason": "등록상품 DB에 없음"}
+            reason = "등록상품 DB에 없음"
+            if source_item_code:
+                reason = f"파일 품목코드 {source_item_code} DB 미등록 · 품목명도 일치하지 않음"
+            return {"status": "missing", "matched_product": "", "components": "", "reason": reason}
         top_score = scored[0][0]
         close = [product for score, product in scored if top_score - score <= 0.025]
         if len(close) > 1:
