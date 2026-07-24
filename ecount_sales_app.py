@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDateEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -33,13 +36,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from supabase import create_client
+from supabase import ClientOptions, create_client
 
 from ecount_sales_core import (
     ConversionResult,
     ReferenceCatalog,
     VoucherLine,
     convert_orders,
+    normalize_source,
     read_smartstore_orders,
     write_ecount_workbook,
 )
@@ -49,12 +53,22 @@ SOURCE_DIR = Path(__file__).resolve().parent
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else SOURCE_DIR
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR))
 LOCAL_DATA_DIR = BUNDLE_DIR / "supabase" / "ecount_migration" / "data"
+DB_LOG_PATH = APP_DIR / "db_connection.log"
+
+
+def write_db_log(message: str) -> None:
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with DB_LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def load_config() -> dict[str, str]:
     for config_path in (APP_DIR / "config.json", APP_DIR.parent / "config.json", SOURCE_DIR / "config.json"):
         if config_path.exists():
-            return json.loads(config_path.read_text(encoding="utf-8"))
+            return json.loads(config_path.read_text(encoding="utf-8-sig"))
     return {}
 
 
@@ -69,13 +83,247 @@ def fetch_all(client, table_name: str) -> list[dict]:
         start += 1000
 
 
+class SupabaseConnectWorker(QObject):
+    status_changed = Signal(str)
+    connected = Signal(object, object)
+    failed = Signal(str)
+    finished = Signal()
+
+    def __init__(self, url: str, key: str, email: str, password: str) -> None:
+        super().__init__()
+        self.url = url
+        self.key = key
+        self.email = email
+        self.password = password
+
+    def run(self) -> None:
+        try:
+            write_db_log(f"인증 요청 시작: {self.email}")
+            self.status_changed.emit("계정 로그인 확인 중...")
+            client = create_client(
+                self.url,
+                self.key,
+                options=ClientOptions(
+                    postgrest_client_timeout=20,
+                    storage_client_timeout=20,
+                    function_client_timeout=20,
+                ),
+            )
+            auth_response = client.auth.sign_in_with_password(
+                {"email": self.email, "password": self.password}
+            )
+            if not auth_response.session:
+                raise RuntimeError("로그인 세션을 받지 못했습니다.")
+            write_db_log("계정 로그인 성공")
+            self.status_changed.emit("로그인 완료 · 최신 DB 불러오는 중...")
+            catalog = ReferenceCatalog(
+                fetch_all(client, "ecount_item_reference"),
+                fetch_all(client, "ecount_sales_channels"),
+                fetch_all(client, "ecount_product_mappings"),
+                fetch_all(client, "ecount_product_mapping_components"),
+                fetch_all(client, "ecount_price_rules"),
+                fetch_all(client, "ecount_price_rule_components"),
+            )
+            write_db_log("DB 테이블 조회 및 기준정보 구성 성공")
+            self.connected.emit(client, catalog)
+        except Exception as exc:
+            write_db_log(f"연결 실패: {type(exc).__name__}: {exc}")
+            self.failed.emit(str(exc))
+        finally:
+            self.password = ""
+            self.finished.emit()
+
+
+class SetMappingDialog(QDialog):
+    def __init__(
+        self,
+        order,
+        items: dict[str, dict],
+        existing_components: list[dict] | None = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.order = order
+        self.items = items
+        self.setWindowTitle("확인 필요 품목 · 세트 DB 연결")
+        self.resize(820, 430)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"{order.product_name}\n옵션: {order.options or '(없음)'}")
+        title.setStyleSheet("font-weight:700;color:#173F5F;")
+        layout.addWidget(title)
+        self.target_label = QLabel(f"세트 1개 기준 배분 대상 금액: {order.unit_total:,.0f}원")
+        layout.addWidget(self.target_label)
+
+        self.component_table = QTableWidget(0, 4)
+        self.component_table.setHorizontalHeaderLabels(["DB 품목", "세트당 수량", "개당 금액", "배분 금액"])
+        self.component_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for column in (1, 2, 3):
+            self.component_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        layout.addWidget(self.component_table)
+
+        controls = QHBoxLayout()
+        add_button = QPushButton("구성품 추가")
+        remove_button = QPushButton("선택 구성품 삭제")
+        add_button.clicked.connect(self.add_component_row)
+        remove_button.clicked.connect(self.remove_selected_component)
+        controls.addWidget(add_button)
+        controls.addWidget(remove_button)
+        controls.addStretch(1)
+        self.sum_label = QLabel()
+        self.sum_label.setStyleSheet("font-weight:700;")
+        controls.addWidget(self.sum_label)
+        layout.addLayout(controls)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("Supabase에 세트 저장")
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        seeded = existing_components or []
+        if seeded:
+            for component in seeded:
+                self.add_component_row(
+                    str(component.get("item_code") or ""),
+                    Decimal(str(component.get("quantity") or 1)),
+                    Decimal("0"),
+                )
+        else:
+            self.add_component_row()
+            self.add_component_row()
+        self.update_total()
+
+    def add_component_row(
+        self,
+        item_code: str = "",
+        quantity: Decimal = Decimal("1"),
+        unit_price: Decimal = Decimal("0"),
+    ) -> None:
+        if self.component_table.rowCount() >= 5:
+            QMessageBox.information(self, "구성품 제한", "세트 구성품은 최대 5개까지 등록할 수 있습니다.")
+            return
+        row = self.component_table.rowCount()
+        self.component_table.insertRow(row)
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+        combo.addItem("품목코드 또는 품목명 검색", "")
+        for code, item in sorted(self.items.items()):
+            name = str(
+                item.get("representative_name")
+                or item.get("item_name")
+                or item.get("standard_name")
+                or code
+            )
+            combo.addItem(f"{code} | {name}", code)
+        selected = combo.findData(item_code)
+        if selected >= 0:
+            combo.setCurrentIndex(selected)
+        combo.currentIndexChanged.connect(self.update_total)
+        self.component_table.setCellWidget(row, 0, combo)
+
+        quantity_input = QSpinBox()
+        quantity_input.setRange(1, 9999)
+        quantity_input.setValue(max(1, int(quantity)))
+        quantity_input.valueChanged.connect(self.update_total)
+        self.component_table.setCellWidget(row, 1, quantity_input)
+
+        price_input = QLineEdit(f"{unit_price:,.0f}")
+        price_input.setAlignment(Qt.AlignRight)
+        price_input.textChanged.connect(self.update_total)
+        self.component_table.setCellWidget(row, 2, price_input)
+        total_item = QTableWidgetItem("0")
+        total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+        total_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.component_table.setItem(row, 3, total_item)
+        self.update_total()
+
+    def remove_selected_component(self) -> None:
+        rows = sorted({index.row() for index in self.component_table.selectedIndexes()}, reverse=True)
+        if not rows and self.component_table.currentRow() >= 0:
+            rows = [self.component_table.currentRow()]
+        for row in rows:
+            self.component_table.removeRow(row)
+        self.update_total()
+
+    def _price_at(self, row: int) -> Decimal:
+        widget = self.component_table.cellWidget(row, 2)
+        try:
+            return Decimal(widget.text().replace(",", "").strip() or "0")
+        except Exception:
+            return Decimal("-1")
+
+    def update_total(self, *_args) -> None:
+        total = Decimal("0")
+        for row in range(self.component_table.rowCount()):
+            quantity = Decimal(self.component_table.cellWidget(row, 1).value())
+            price = self._price_at(row)
+            allocated = quantity * max(price, Decimal("0"))
+            total += allocated
+            item = self.component_table.item(row, 3)
+            if item is not None:
+                item.setText(f"{allocated:,.0f}")
+        difference = self.order.unit_total - total
+        self.sum_label.setText(f"배분 합계 {total:,.0f}원 · 차이 {difference:,.0f}원")
+        self.sum_label.setStyleSheet(
+            "font-weight:700;color:#047857;" if difference == 0
+            else "font-weight:700;color:#B91C1C;"
+        )
+
+    def components(self) -> list[dict]:
+        result: list[dict] = []
+        for row in range(self.component_table.rowCount()):
+            combo = self.component_table.cellWidget(row, 0)
+            item_code = str(combo.currentData() or "").strip()
+            if not item_code:
+                typed = combo.currentText().split("|", 1)[0].strip()
+                if typed in self.items:
+                    item_code = typed
+            quantity = Decimal(self.component_table.cellWidget(row, 1).value())
+            unit_price = self._price_at(row)
+            result.append(
+                {"item_code": item_code, "quantity": quantity, "unit_price": unit_price}
+            )
+        return result
+
+    def validate_and_accept(self) -> None:
+        components = self.components()
+        if len(components) < 2:
+            QMessageBox.warning(self, "세트 구성 확인", "세트 구성품을 2개 이상 입력해주세요.")
+            return
+        if any(row["item_code"] not in self.items for row in components):
+            QMessageBox.warning(self, "품목 확인", "모든 구성품을 판매전표 DB 품목에서 선택해주세요.")
+            return
+        if any(row["unit_price"] < 0 or row["unit_price"] != row["unit_price"].to_integral_value() for row in components):
+            QMessageBox.warning(self, "금액 확인", "구성품 금액은 0 이상의 원 단위 정수로 입력해주세요.")
+            return
+        allocated_total = sum(
+            (row["quantity"] * row["unit_price"] for row in components),
+            Decimal("0"),
+        )
+        if allocated_total != self.order.unit_total:
+            QMessageBox.warning(
+                self,
+                "배분 금액 불일치",
+                f"구성품 배분 합계가 {allocated_total:,.0f}원입니다.\n"
+                f"세트 1개 금액 {self.order.unit_total:,.0f}원과 정확히 일치해야 합니다.",
+            )
+            return
+        self.accept()
+
+
 class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("REQM 판매전표 반자동화 - 테스트")
+        write_db_log("프로그램 시작")
+        self.setWindowTitle("REQM 판매전표 반자동화 - DB 로그인 수정본")
         self.resize(1280, 760)
         self.catalog: ReferenceCatalog | None = None
         self.supabase_client = None
+        self.db_thread: QThread | None = None
+        self.db_worker: SupabaseConnectWorker | None = None
+        self.db_connecting = False
         self.current_result: ConversionResult | None = None
         self.file_path = QLineEdit()
         self.file_path.setPlaceholderText("스마트스토어에서 내려받은 원본 Excel을 선택하세요")
@@ -128,11 +376,13 @@ class SalesVoucherWindow(QMainWindow):
         connection_layout.setSpacing(6)
         self.email.setPlaceholderText("이메일")
         self.password.setPlaceholderText("비밀번호 (저장하지 않음)")
-        connect_button = QPushButton("DB 연결")
-        connect_button.clicked.connect(self.connect_supabase)
+        self.connect_button = QPushButton("DB 로그인")
+        self.connect_button.pressed.connect(self.connect_supabase)
+        self.email.returnPressed.connect(self.connect_supabase)
+        self.password.returnPressed.connect(self.connect_supabase)
         connection_layout.addWidget(self.email, 2)
         connection_layout.addWidget(self.password, 2)
-        connection_layout.addWidget(connect_button)
+        connection_layout.addWidget(self.connect_button)
         connection_layout.addWidget(self.db_status, 2)
         connection.setMaximumHeight(72)
         layout.addWidget(connection)
@@ -204,6 +454,8 @@ class SalesVoucherWindow(QMainWindow):
         self.issues_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.issues_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.issues_table.cellDoubleClicked.connect(self.open_set_mapping_dialog)
+        self.issues_table.setToolTip("확인 필요 항목을 더블클릭하면 Supabase 세트 품목과 금액을 연결할 수 있습니다.")
         tabs.addTab(self.issues_table, "확인 필요")
 
         self.shipping_table.setHorizontalHeaderLabels(
@@ -270,35 +522,85 @@ class SalesVoucherWindow(QMainWindow):
             self.db_status.setStyleSheet("color:#B91C1C;")
 
     def connect_supabase(self) -> None:
+        write_db_log("DB 로그인 버튼/Enter 입력 감지")
+        try:
+            self._start_supabase_connection()
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            write_db_log(f"로그인 시작 처리 예외: {detail}")
+            self.db_connecting = False
+            self.connect_button.setEnabled(True)
+            self.connect_button.setText("DB 로그인")
+            self.db_status.setText(f"로그인 시작 오류: {detail}")
+            self.db_status.setStyleSheet("color:#B91C1C;font-weight:600;")
+
+    def _start_supabase_connection(self) -> None:
+        if self.db_connecting:
+            write_db_log("이미 연결 작업이 실행 중이므로 중복 요청 무시")
+            return
         if not self.email.text().strip() or not self.password.text():
+            write_db_log("이메일 또는 비밀번호 미입력")
             QMessageBox.information(self, "로그인 정보", "Supabase 이메일과 비밀번호를 입력해주세요.")
             return
         config = load_config()
         url = config.get("supabase_url", "")
         key = config.get("supabase_publishable_key", "")
         if not url or not key:
+            write_db_log("config.json의 URL 또는 publishable key 누락")
             QMessageBox.critical(self, "설정 오류", "config.json에 Supabase URL과 publishable key가 필요합니다.")
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            client = create_client(url, key)
-            client.auth.sign_in_with_password({"email": self.email.text().strip(), "password": self.password.text()})
-            self.supabase_client = client
-            self.catalog = ReferenceCatalog(
-                fetch_all(client, "ecount_item_reference"),
-                fetch_all(client, "ecount_sales_channels"),
-                fetch_all(client, "ecount_product_mappings"),
-                fetch_all(client, "ecount_product_mapping_components"),
-                fetch_all(client, "ecount_price_rules"),
-                fetch_all(client, "ecount_price_rule_components"),
-            )
-            self.password.clear()
-            self.db_status.setText("Supabase 최신 DB 연결 완료")
-            self.db_status.setStyleSheet("color:#047857;font-weight:600;")
-        except Exception as exc:
-            QMessageBox.critical(self, "DB 연결 실패", str(exc))
-        finally:
-            QApplication.restoreOverrideCursor()
+        write_db_log(f"설정 확인 완료: {url}")
+        self.connect_button.setEnabled(False)
+        self.connect_button.setText("연결 중...")
+        self.db_connecting = True
+        self.db_status.setText("연결 준비 중...")
+        self.db_status.setStyleSheet("color:#B45309;font-weight:600;")
+
+        thread = QThread(self)
+        worker = SupabaseConnectWorker(
+            url,
+            key,
+            self.email.text().strip(),
+            self.password.text(),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.status_changed.connect(self._show_db_progress)
+        worker.connected.connect(self._on_db_connected)
+        worker.failed.connect(self._on_db_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_db_thread_finished)
+        self.db_thread = thread
+        self.db_worker = worker
+        self.password.clear()
+        thread.start()
+
+    def _show_db_progress(self, message: str) -> None:
+        write_db_log(f"진행 상태: {message}")
+        self.db_status.setText(message)
+
+    def _on_db_connected(self, client: object, catalog: object) -> None:
+        self.supabase_client = client
+        self.catalog = catalog
+        write_db_log("프로그램에 Supabase DB 연결 적용 완료")
+        self.db_status.setText("Supabase 최신 DB 연결 완료")
+        self.db_status.setStyleSheet("color:#047857;font-weight:600;")
+
+    def _on_db_failed(self, message: str) -> None:
+        detail = message.strip() or "알 수 없는 오류"
+        write_db_log(f"화면에 실패 표시: {detail}")
+        self.db_status.setText(f"로그인 실패: {detail}")
+        self.db_status.setToolTip(detail)
+        self.db_status.setStyleSheet("color:#B91C1C;font-weight:600;")
+
+    def _on_db_thread_finished(self) -> None:
+        self.db_connecting = False
+        self.connect_button.setEnabled(True)
+        self.connect_button.setText("DB 로그인")
+        self.db_thread = None
+        self.db_worker = None
 
     def choose_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "스마트스토어 원본 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)")
@@ -455,6 +757,155 @@ class SalesVoucherWindow(QMainWindow):
         self._show_result(self.current_result)
         self.export_button.setEnabled(bool(self.current_result.lines))
 
+    def open_set_mapping_dialog(self, issue_row: int, _column: int = 0) -> None:
+        if self.current_result is None or self.catalog is None:
+            return
+        if self.supabase_client is None:
+            QMessageBox.information(
+                self,
+                "DB 연결 필요",
+                "먼저 Supabase 관리자 계정으로 DB 로그인해주세요.",
+            )
+            return
+        if issue_row < 0 or issue_row >= len(self.current_result.issues):
+            return
+        issue = self.current_result.issues[issue_row]
+        order = next(
+            (row for row in self.current_result.orders if row.source_row == issue.source_row),
+            None,
+        )
+        if order is None:
+            return
+        existing_mapping = self.catalog.mappings.get(
+            ("리큐엠_스마트스토어", order.normalized_source),
+            {},
+        )
+        dialog = SetMappingDialog(
+            order,
+            self.catalog.items,
+            existing_mapping.get("components", []),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        components = dialog.components()
+        allocated_total = sum(
+            (row["quantity"] * row["unit_price"] for row in components),
+            Decimal("0"),
+        )
+        mapping_key = str(existing_mapping.get("mapping_key") or "")
+        if not mapping_key:
+            mapping_key = hashlib.sha256(
+                f"리큐엠_스마트스토어|{order.normalized_source}".encode("utf-8")
+            ).hexdigest()
+        price_rule_key = hashlib.sha256(
+            (
+                f"리큐엠_스마트스토어|{order.normalized_source}|"
+                f"{order.unit_total:.2f}"
+            ).encode("utf-8")
+        ).hexdigest()
+        source_text = f"{order.product_name}{order.options}"
+        try:
+            self.db_status.setText("세트 매핑을 Supabase에 저장 중...")
+            self.supabase_client.table("ecount_product_mappings").upsert(
+                {
+                    "mapping_key": mapping_key,
+                    "source_channel": "리큐엠_스마트스토어",
+                    "source_product_text": source_text,
+                    "normalized_source": order.normalized_source,
+                    "mapping_type": "set",
+                    "component_count": len(components),
+                    "source_row": order.source_row,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                },
+                on_conflict="mapping_key",
+            ).execute()
+            self.supabase_client.table("ecount_product_mapping_components").delete().eq(
+                "mapping_key", mapping_key
+            ).execute()
+            self.supabase_client.table("ecount_product_mapping_components").insert(
+                [
+                    {
+                        "mapping_key": mapping_key,
+                        "sequence": sequence,
+                        "item_code": component["item_code"],
+                        "quantity": float(component["quantity"]),
+                        "source_row": order.source_row,
+                    }
+                    for sequence, component in enumerate(components, start=1)
+                ]
+            ).execute()
+
+            self.supabase_client.table("ecount_price_rules").upsert(
+                {
+                    "price_rule_key": price_rule_key,
+                    "source_channel": "리큐엠_스마트스토어",
+                    "source_product_name": order.product_name,
+                    "source_options": order.options,
+                    "normalized_source": order.normalized_source,
+                    "total_unit_price": float(order.unit_total),
+                    "item_type": "세트",
+                    "main_product": components[0]["item_code"],
+                    "set_name": order.options or order.product_name,
+                    "component_count": len(components),
+                    "allocated_total": float(allocated_total),
+                    "allocation_variance": 0,
+                    "source_row": order.source_row,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                },
+                on_conflict="price_rule_key",
+            ).execute()
+            self.supabase_client.table("ecount_price_rule_components").delete().eq(
+                "price_rule_key", price_rule_key
+            ).execute()
+            price_components = []
+            for sequence, component in enumerate(components, start=1):
+                item = self.catalog.items[component["item_code"]]
+                alias = str(
+                    item.get("representative_name")
+                    or item.get("item_name")
+                    or item.get("standard_name")
+                    or component["item_code"]
+                )
+                price_components.append(
+                    {
+                        "price_rule_key": price_rule_key,
+                        "sequence": sequence,
+                        "component_alias": alias,
+                        "normalized_component_alias": normalize_source(alias),
+                        "item_code": component["item_code"],
+                        "quantity": float(component["quantity"]),
+                        "allocated_unit_price": float(component["unit_price"]),
+                        "source_row": order.source_row,
+                        "review_status": "confirmed",
+                    }
+                )
+            self.supabase_client.table("ecount_price_rule_components").insert(
+                price_components
+            ).execute()
+            self._reload_supabase_catalog()
+            self.db_status.setText("세트 DB 저장 완료 · 주문 다시 분석")
+            self.db_status.setStyleSheet("color:#047857;font-weight:600;")
+            self.analyze()
+        except Exception as exc:
+            self.db_status.setText(f"세트 DB 저장 실패: {exc}")
+            self.db_status.setStyleSheet("color:#B91C1C;font-weight:600;")
+            QMessageBox.critical(self, "세트 DB 저장 실패", str(exc))
+
+    def _reload_supabase_catalog(self) -> None:
+        if self.supabase_client is None:
+            return
+        self.catalog = ReferenceCatalog(
+            fetch_all(self.supabase_client, "ecount_item_reference"),
+            fetch_all(self.supabase_client, "ecount_sales_channels"),
+            fetch_all(self.supabase_client, "ecount_product_mappings"),
+            fetch_all(self.supabase_client, "ecount_product_mapping_components"),
+            fetch_all(self.supabase_client, "ecount_price_rules"),
+            fetch_all(self.supabase_client, "ecount_price_rule_components"),
+        )
+
     def add_selected_issue_to_db(self) -> None:
         if self.current_result is None or self.catalog is None:
             return
@@ -521,14 +972,7 @@ class SalesVoucherWindow(QMainWindow):
                 },
                 on_conflict="mapping_key,sequence",
             ).execute()
-            self.catalog = ReferenceCatalog(
-                fetch_all(self.supabase_client, "ecount_item_reference"),
-                fetch_all(self.supabase_client, "ecount_sales_channels"),
-                fetch_all(self.supabase_client, "ecount_product_mappings"),
-                fetch_all(self.supabase_client, "ecount_product_mapping_components"),
-                fetch_all(self.supabase_client, "ecount_price_rules"),
-                fetch_all(self.supabase_client, "ecount_price_rule_components"),
-            )
+            self._reload_supabase_catalog()
             self.analyze()
         except Exception as exc:
             QMessageBox.critical(self, "DB 추가 실패", str(exc))
