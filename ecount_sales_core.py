@@ -5,7 +5,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -98,6 +98,8 @@ class VoucherLine:
     source_count: int = 1
     source_orders: list[str] = field(default_factory=list)
     is_shipping: bool = False
+    needs_review: bool = False
+    review_reason: str = ""
 
     @property
     def total(self) -> Decimal:
@@ -318,25 +320,43 @@ def convert_orders(
             continue
         mapping = catalog.mappings.get((channel_name, order.normalized_source))
         if not mapping:
-            issues.append(_issue(order, "상품/옵션 조합이 DB에 없습니다."))
+            reason = "상품/옵션 조합이 DB에 없습니다."
+            issues.append(_issue(order, reason))
+            _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
         components = mapping.get("components", [])
         if mapping.get("mapping_type") == "single":
             if len(components) != 1:
-                issues.append(_issue(order, "단품 매핑의 구성품 수가 1개가 아닙니다."))
+                reason = "단품 매핑의 구성품 수가 1개가 아닙니다."
+                issues.append(_issue(order, reason))
+                _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
                 continue
             component = components[0]
-            _append_line(raw_lines, catalog, customer_code, customer_name, component, order.quantity, order.unit_total, default_warehouse, order.order_no)
+            _append_exact_total_lines(
+                raw_lines,
+                catalog,
+                customer_code,
+                customer_name,
+                component,
+                order.quantity,
+                order.item_total,
+                default_warehouse,
+                order.order_no,
+            )
             continue
 
         templates = catalog.price_templates.get((channel_name, order.normalized_source), [])
         if not templates:
-            issues.append(_issue(order, "세트 가격 배분 기준이 DB에 없습니다."))
+            reason = "세트 가격 배분 기준이 DB에 없습니다."
+            issues.append(_issue(order, reason))
+            _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
         template = min(templates, key=lambda row: abs(row["total_unit_price"] - order.unit_total))
         price_components = template["components"]
         if len(price_components) < 2:
-            issues.append(_issue(order, "세트 가격 배분 구성품이 부족합니다."))
+            reason = "세트 가격 배분 구성품이 부족합니다."
+            issues.append(_issue(order, reason))
+            _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
         fixed_total = sum(
             (as_decimal(row.get("allocated_unit_price")) * as_decimal(row.get("quantity"), Decimal("1")))
@@ -346,7 +366,9 @@ def convert_orders(
         main_quantity = as_decimal(main.get("quantity"), Decimal("1"))
         main_price = ((order.unit_total - fixed_total) / main_quantity).quantize(MONEY, rounding=ROUND_HALF_UP)
         if main_price < 0:
-            issues.append(_issue(order, f"세트 차감 후 본품 단가가 음수입니다: {main_price}"))
+            reason = f"세트 차감 후 본품 단가가 음수입니다: {main_price}"
+            issues.append(_issue(order, reason))
+            _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
         _append_line(raw_lines, catalog, customer_code, customer_name, main, order.quantity * main_quantity, main_price, default_warehouse, order.order_no)
         for component in price_components[1:]:
@@ -392,9 +414,16 @@ def convert_orders(
             )
         )
 
-    aggregated: dict[tuple[str, str, str, Decimal], VoucherLine] = {}
+    aggregated: dict[tuple[Any, ...], VoucherLine] = {}
     for line in raw_lines:
-        key = (line.customer_code, line.item_code, line.warehouse, line.unit_price)
+        key = (
+            line.customer_code,
+            line.item_code,
+            line.item_name if line.needs_review else "",
+            line.warehouse,
+            line.unit_price,
+            line.source_orders[0] if line.needs_review and line.source_orders else "",
+        )
         if key not in aggregated:
             aggregated[key] = line
         else:
@@ -427,9 +456,9 @@ def _collect_shipping_charges(
             issues.append(_issue(first, "같은 배송비 묶음번호에 서로 다른 배송비가 있습니다."))
             continue
         shipping_total, extra_shipping, shipping_discount = next(iter(signatures))
-        effective = shipping_total + extra_shipping - shipping_discount
+        effective = shipping_total + extra_shipping
         if effective < 0:
-            issues.append(_issue(first, f"배송비 할인 후 금액이 음수입니다: {effective}"))
+            issues.append(_issue(first, f"배송비 합계와 추가배송비의 합이 음수입니다: {effective}"))
             continue
         charges.append(
             ShippingCharge(
@@ -474,6 +503,84 @@ def _append_line(
     )
 
 
+def _append_exact_total_lines(
+    target: list[VoucherLine],
+    catalog: ReferenceCatalog,
+    customer_code: str,
+    customer_name: str,
+    component: dict[str, Any],
+    quantity: Decimal,
+    total: Decimal,
+    default_warehouse: str,
+    order_no: str,
+) -> None:
+    if (
+        quantity > 0
+        and quantity == quantity.to_integral_value()
+        and total == total.to_integral_value()
+    ):
+        base_price = (total / quantity).quantize(Decimal("1"), rounding=ROUND_DOWN)
+        higher_price_quantity = total - (base_price * quantity)
+        base_price_quantity = quantity - higher_price_quantity
+        if base_price_quantity > 0:
+            _append_line(
+                target, catalog, customer_code, customer_name, component,
+                base_price_quantity, base_price, default_warehouse, order_no,
+            )
+        if higher_price_quantity > 0:
+            _append_line(
+                target, catalog, customer_code, customer_name, component,
+                higher_price_quantity, base_price + 1, default_warehouse, order_no,
+            )
+        return
+    _append_line(
+        target, catalog, customer_code, customer_name, component,
+        quantity, (total / quantity).quantize(MONEY, rounding=ROUND_HALF_UP),
+        default_warehouse, order_no,
+    )
+
+
+def _append_review_line(
+    target: list[VoucherLine],
+    customer_code: str,
+    customer_name: str,
+    order: SmartStoreOrder,
+    default_warehouse: str,
+    reason: str,
+) -> None:
+    splits = [(order.quantity, order.unit_total)]
+    if (
+        order.quantity > 0
+        and order.quantity == order.quantity.to_integral_value()
+        and order.item_total == order.item_total.to_integral_value()
+    ):
+        base_price = (order.item_total / order.quantity).quantize(Decimal("1"), rounding=ROUND_DOWN)
+        higher_price_quantity = order.item_total - (base_price * order.quantity)
+        splits = [
+            (quantity, unit_price)
+            for quantity, unit_price in (
+                (order.quantity - higher_price_quantity, base_price),
+                (higher_price_quantity, base_price + 1),
+            )
+            if quantity > 0
+        ]
+    for quantity, unit_price in splits:
+        target.append(
+            VoucherLine(
+                customer_code=customer_code,
+                customer_name=customer_name,
+                item_code="",
+                item_name=f"[확인필요] {order.product_name} {order.options}".strip(),
+                quantity=quantity,
+                unit_price=unit_price,
+                warehouse=default_warehouse,
+                source_orders=[order.order_no],
+                needs_review=True,
+                review_reason=reason,
+            )
+        )
+
+
 def _issue(order: SmartStoreOrder, reason: str) -> ReviewIssue:
     return ReviewIssue(order.source_row, order.order_no, order.product_name, order.options, order.quantity, order.item_total, reason)
 
@@ -484,8 +591,6 @@ def write_ecount_workbook(
     voucher_date: date,
     manager_code: str = "00109",
 ) -> None:
-    if result.issues:
-        raise ValueError(f"확인 필요 항목 {len(result.issues)}건이 있어 전표를 저장할 수 없습니다.")
     if not result.is_reconciled:
         raise ValueError(f"금액 차이 {result.amount_difference:,.0f}원이 있어 전표를 저장할 수 없습니다.")
     workbook = Workbook()
@@ -501,9 +606,11 @@ def write_ecount_workbook(
         upload.append([
             date_number, None, line.customer_code, line.customer_name, manager_code, line.warehouse, None, None, None, None, None, None,
             line.item_code, line.item_name, None, float(line.quantity), float(line.unit_price), None,
-            f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}", None, None,
+            f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}",
+            f"확인필요: {line.review_reason}" if line.needs_review else None,
+            None,
         ])
-    _style_upload_sheet(upload, len(result.lines) + 1)
+    _style_upload_sheet(upload, result.lines)
 
     review = workbook.create_sheet("검수결과")
     review.append(["구분", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
@@ -516,12 +623,12 @@ def write_ecount_workbook(
     review.append(["확인 필요행", len(result.issues)])
     review.append(["원본 품목금액", float(result.input_total)])
     review.append(["제외 품목금액", float(result.excluded_total)])
-    review.append(["실제 배송비", float(result.shipping_total)])
+    review.append(["전표 배송비(할인 미차감)", float(result.shipping_total)])
     review.append(["검수 기준금액", float(result.expected_output_total)])
     review.append(["전표 총금액", float(result.output_total)])
     review.append(["금액 차이", float(result.amount_difference)])
     review.append([])
-    review.append(["배송비 묶음번호", "원배송비", "추가배송비", "할인액", "실제 배송비", "조정 여부"])
+    review.append(["배송비 묶음번호", "원배송비", "추가배송비", "할인액(참고)", "전표 배송비(할인 미차감)", "조정 여부"])
     for charge in result.shipping_charges:
         review.append([
             charge.bundle_key,
@@ -536,7 +643,8 @@ def write_ecount_workbook(
     workbook.save(path)
 
 
-def _style_upload_sheet(sheet: Any, last_row: int) -> None:
+def _style_upload_sheet(sheet: Any, lines: list[VoucherLine]) -> None:
+    last_row = len(lines) + 1
     header_fill = PatternFill("solid", fgColor="00A651")
     for cell in sheet[1]:
         cell.fill = header_fill
@@ -552,6 +660,11 @@ def _style_upload_sheet(sheet: Any, last_row: int) -> None:
         sheet.cell(row, 13).number_format = "@"
         for column in (16, 17, 19, 20):
             sheet.cell(row, column).number_format = "#,##0"
+        if lines[row - 2].needs_review:
+            for cell in sheet[row]:
+                cell.fill = PatternFill("solid", fgColor="FFF2CC")
+            sheet.cell(row, 13).font = Font(color="C00000", bold=True)
+            sheet.cell(row, 14).font = Font(color="C00000", bold=True)
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:V{max(last_row, 1)}"
 

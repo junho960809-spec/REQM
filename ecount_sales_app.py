@@ -170,7 +170,7 @@ class SalesVoucherWindow(QMainWindow):
             ("전표 품목행", self.summary_lines, "#047857"),
             ("확인 필요", self.summary_issues, "#B45309"),
             ("전표 총액", self.summary_total, "#0F172A"),
-            ("실제 배송비", self.summary_shipping, "#7C3AED"),
+            ("전표 배송비", self.summary_shipping, "#7C3AED"),
             ("금액 차이", self.summary_difference, "#B91C1C"),
         ):
             card = QFrame()
@@ -207,7 +207,7 @@ class SalesVoucherWindow(QMainWindow):
         tabs.addTab(self.issues_table, "확인 필요")
 
         self.shipping_table.setHorizontalHeaderLabels(
-            ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액", "실제 배송비", "구분"]
+            ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액(참고)", "전표 배송비", "구분"]
         )
         self.shipping_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.shipping_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -340,7 +340,6 @@ class SalesVoucherWindow(QMainWindow):
         )
         self.lines_table.setSortingEnabled(False)
         self.lines_table.setRowCount(len(result.lines))
-        editable_columns = {2, 3, 5}
         for row_index, line in enumerate(result.lines):
             values = [
                 line.item_code,
@@ -351,12 +350,18 @@ class SalesVoucherWindow(QMainWindow):
                 line.warehouse,
                 str(line.source_count),
             ]
+            editable_columns = {2, 3, 5}
+            if line.needs_review:
+                editable_columns.update({0, 1})
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column not in editable_columns:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 else:
                     item.setBackground(QColor("#FFF4CC"))
+                if line.needs_review:
+                    item.setBackground(QColor("#FDE68A"))
+                    item.setToolTip(f"확인 필요: {line.review_reason}")
                 if column in {2, 3, 4, 6}:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.lines_table.setItem(row_index, column, item)
@@ -410,14 +415,16 @@ class SalesVoucherWindow(QMainWindow):
                 VoucherLine(
                     customer_code=original.customer_code,
                     customer_name=original.customer_name,
-                    item_code=original.item_code,
-                    item_name=original.item_name,
+                    item_code=self.lines_table.item(row, 0).text().strip(),
+                    item_name=self.lines_table.item(row, 1).text().strip(),
                     quantity=quantity,
                     unit_price=unit_price,
                     warehouse=warehouse,
                     source_count=original.source_count,
                     source_orders=original.source_orders,
                     is_shipping=original.is_shipping,
+                    needs_review=original.needs_review,
+                    review_reason=original.review_reason,
                 )
             )
         self.current_result.lines = updated
@@ -528,14 +535,6 @@ class SalesVoucherWindow(QMainWindow):
 
     def export_excel(self) -> None:
         if self.current_result is None:
-            return
-        if self.current_result.issues:
-            QMessageBox.warning(
-                self,
-                "저장 차단",
-                f"확인 필요한 주문이 {len(self.current_result.issues)}건 있습니다.\n"
-                "DB에 추가하거나 분석에서 명시적으로 삭제한 뒤 저장해주세요.",
-            )
             return
         try:
             self._apply_table_edits()

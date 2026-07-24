@@ -114,14 +114,14 @@ class SalesCoreTests(unittest.TestCase):
             result = convert_orders(orders, self.catalog)
             shipping_lines = [line for line in result.lines if line.is_shipping]
             self.assertEqual(len(result.shipping_charges), 1)
-            self.assertEqual(result.shipping_charges[0].effective_amount, Decimal("3000.00"))
+            self.assertEqual(result.shipping_charges[0].effective_amount, Decimal("9000.00"))
             self.assertTrue(result.shipping_charges[0].is_adjusted)
             self.assertEqual(len(shipping_lines), 1)
             self.assertEqual(shipping_lines[0].quantity, Decimal("1"))
-            self.assertEqual(shipping_lines[0].unit_price, Decimal("3000.00"))
+            self.assertEqual(shipping_lines[0].unit_price, Decimal("9000.00"))
             self.assertTrue(result.is_reconciled)
 
-    def test_export_is_blocked_when_review_issue_exists(self) -> None:
+    def test_review_issue_is_included_and_highlighted_in_export(self) -> None:
         order = SmartStoreOrder(
             source_row=2,
             order_no="ORDER-2",
@@ -134,11 +134,53 @@ class SalesCoreTests(unittest.TestCase):
             item_total=Decimal("27800"),
         )
         result = convert_orders([order], self.catalog)
-        self.assertEqual(result.amount_difference, Decimal("27800.00"))
-        self.assertFalse(result.is_reconciled)
+        self.assertEqual(result.amount_difference, Decimal("0.00"))
+        self.assertTrue(result.is_reconciled)
+        self.assertTrue(result.lines[0].needs_review)
         with tempfile.TemporaryDirectory() as folder:
-            with self.assertRaisesRegex(ValueError, "확인 필요 항목"):
-                write_ecount_workbook(Path(folder) / "blocked.xlsx", result, date(2026, 7, 22))
+            output = Path(folder) / "review.xlsx"
+            write_ecount_workbook(output, result, date(2026, 7, 22))
+            workbook = load_workbook(output, data_only=False)
+            sheet = workbook["이카운트 웹입력"]
+            self.assertEqual(sheet["M2"].value, None)
+            self.assertTrue(sheet["N2"].value.startswith("[확인필요]"))
+            self.assertTrue(sheet["U2"].value.startswith("확인필요:"))
+            self.assertEqual(sheet["A2"].fill.fgColor.rgb, "00FFF2CC")
+            workbook.close()
+
+    def test_single_item_total_is_split_without_fractional_won_error(self) -> None:
+        catalog = ReferenceCatalog(
+            items=[{"item_code": "MAIN", "representative_name": "본품"}],
+            channels=[
+                {"source_name": "리큐엠_스마트스토어", "ecount_customer_code": "AC008712", "ecount_customer_name": "샵N", "is_active": True}
+            ],
+            mappings=[
+                {"mapping_key": "single-1", "source_channel": "리큐엠_스마트스토어", "normalized_source": "단품", "mapping_type": "single", "review_status": "confirmed", "is_active": True}
+            ],
+            mapping_components=[
+                {"mapping_key": "single-1", "sequence": 1, "item_code": "MAIN", "quantity": 1}
+            ],
+            price_rules=[],
+            price_components=[],
+        )
+        order = SmartStoreOrder(
+            source_row=2,
+            order_no="ORDER-3",
+            product_order_no="PRODUCT-3",
+            paid_at=datetime(2026, 7, 23, 10, 0),
+            status="구매확정",
+            product_name="단품",
+            options="",
+            quantity=Decimal("7"),
+            item_total=Decimal("257800"),
+        )
+        result = convert_orders([order], catalog)
+        self.assertEqual(
+            sorted((line.quantity, line.unit_price) for line in result.lines),
+            [(Decimal("3"), Decimal("36828.00")), (Decimal("4"), Decimal("36829.00"))],
+        )
+        self.assertEqual(result.output_total, Decimal("257800.00"))
+        self.assertTrue(result.is_reconciled)
 
 
 if __name__ == "__main__":
