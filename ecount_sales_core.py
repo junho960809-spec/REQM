@@ -70,6 +70,10 @@ class SmartStoreOrder:
     options: str
     quantity: Decimal
     item_total: Decimal
+    shipping_bundle_no: str = ""
+    shipping_total: Decimal = Decimal("0")
+    extra_shipping: Decimal = Decimal("0")
+    shipping_discount: Decimal = Decimal("0")
 
     @property
     def normalized_source(self) -> str:
@@ -93,6 +97,7 @@ class VoucherLine:
     warehouse: str
     source_count: int = 1
     source_orders: list[str] = field(default_factory=list)
+    is_shipping: bool = False
 
     @property
     def total(self) -> Decimal:
@@ -111,10 +116,26 @@ class ReviewIssue:
 
 
 @dataclass
+class ShippingCharge:
+    bundle_key: str
+    order_no: str
+    source_row: int
+    shipping_total: Decimal
+    extra_shipping: Decimal
+    shipping_discount: Decimal
+    effective_amount: Decimal
+
+    @property
+    def is_adjusted(self) -> bool:
+        return self.extra_shipping != 0 or self.shipping_discount != 0
+
+
+@dataclass
 class ConversionResult:
     orders: list[SmartStoreOrder]
     lines: list[VoucherLine]
     issues: list[ReviewIssue]
+    shipping_charges: list[ShippingCharge] = field(default_factory=list)
 
     @property
     def input_total(self) -> Decimal:
@@ -123,6 +144,26 @@ class ConversionResult:
     @property
     def output_total(self) -> Decimal:
         return sum((row.total for row in self.lines), Decimal("0"))
+
+    @property
+    def shipping_total(self) -> Decimal:
+        return sum((row.effective_amount for row in self.shipping_charges), Decimal("0"))
+
+    @property
+    def excluded_total(self) -> Decimal:
+        return sum((row.amount for row in self.issues if "배송비" not in row.reason), Decimal("0"))
+
+    @property
+    def expected_output_total(self) -> Decimal:
+        return self.input_total + self.shipping_total
+
+    @property
+    def amount_difference(self) -> Decimal:
+        return self.expected_output_total - self.output_total
+
+    @property
+    def is_reconciled(self) -> bool:
+        return self.amount_difference == 0
 
 
 class ReferenceCatalog:
@@ -227,7 +268,7 @@ def read_smartstore_orders(path: str | Path, target_date: date) -> list[SmartSto
             if quantity <= 0:
                 continue
             amount = Decimal("0")
-            for field_name in ("최초 상품별 총 주문금액", "최종 상품별 총 주문금액"):
+            for field_name in ("최종 상품별 총 주문금액", "최초 상품별 총 주문금액"):
                 if field_name in indexes and row[indexes[field_name]] not in (None, ""):
                     amount = as_decimal(row[indexes[field_name]])
                     break
@@ -247,6 +288,10 @@ def read_smartstore_orders(path: str | Path, target_date: date) -> list[SmartSto
                     options=str(row[indexes["옵션정보"]] or "").strip(),
                     quantity=quantity,
                     item_total=amount,
+                    shipping_bundle_no=clean_identifier(row[indexes["배송비 묶음번호"]]) if "배송비 묶음번호" in indexes else "",
+                    shipping_total=as_decimal(row[indexes["배송비 합계"]]) if "배송비 합계" in indexes else Decimal("0"),
+                    extra_shipping=as_decimal(row[indexes["제주/도서 추가배송비"]]) if "제주/도서 추가배송비" in indexes else Decimal("0"),
+                    shipping_discount=as_decimal(row[indexes["배송비 할인액"]]) if "배송비 할인액" in indexes else Decimal("0"),
                 )
             )
         return result
@@ -265,6 +310,7 @@ def convert_orders(
     customer_name = str(channel.get("ecount_customer_name") or "샵N")
     raw_lines: list[VoucherLine] = []
     issues: list[ReviewIssue] = []
+    shipping_charges = _collect_shipping_charges(orders, issues)
 
     for order in orders:
         if any(word in order.status for word in ("취소", "반품", "교환")):
@@ -317,6 +363,35 @@ def convert_orders(
                 order.order_no,
             )
 
+    shipping_item = catalog.items.get("택배운송비", {})
+    shipping_name = str(
+        shipping_item.get("representative_name")
+        or shipping_item.get("item_name")
+        or shipping_item.get("standard_name")
+        or "배송비"
+    )
+    shipping_counts: dict[Decimal, int] = defaultdict(int)
+    shipping_orders: dict[Decimal, list[str]] = defaultdict(list)
+    for charge in shipping_charges:
+        if charge.effective_amount > 0:
+            shipping_counts[charge.effective_amount] += 1
+            shipping_orders[charge.effective_amount].append(charge.order_no)
+    for unit_price, count in shipping_counts.items():
+        raw_lines.append(
+            VoucherLine(
+                customer_code=customer_code,
+                customer_name=customer_name,
+                item_code="택배운송비",
+                item_name=shipping_name,
+                quantity=Decimal(count),
+                unit_price=unit_price,
+                warehouse=default_warehouse,
+                source_count=count,
+                source_orders=shipping_orders[unit_price],
+                is_shipping=True,
+            )
+        )
+
     aggregated: dict[tuple[str, str, str, Decimal], VoucherLine] = {}
     for line in raw_lines:
         key = (line.customer_code, line.item_code, line.warehouse, line.unit_price)
@@ -328,7 +403,46 @@ def convert_orders(
             current.source_count += line.source_count
             current.source_orders.extend(line.source_orders)
     lines = sorted(aggregated.values(), key=lambda row: (row.item_code, row.unit_price, row.warehouse))
-    return ConversionResult(orders=orders, lines=lines, issues=issues)
+    return ConversionResult(orders=orders, lines=lines, issues=issues, shipping_charges=shipping_charges)
+
+
+def _collect_shipping_charges(
+    orders: list[SmartStoreOrder],
+    issues: list[ReviewIssue],
+) -> list[ShippingCharge]:
+    grouped: dict[str, list[SmartStoreOrder]] = defaultdict(list)
+    for order in orders:
+        key = order.shipping_bundle_no or order.order_no
+        if key:
+            grouped[key].append(order)
+
+    charges: list[ShippingCharge] = []
+    for key, group in grouped.items():
+        signatures = {
+            (order.shipping_total, order.extra_shipping, order.shipping_discount)
+            for order in group
+        }
+        first = group[0]
+        if len(signatures) != 1:
+            issues.append(_issue(first, "같은 배송비 묶음번호에 서로 다른 배송비가 있습니다."))
+            continue
+        shipping_total, extra_shipping, shipping_discount = next(iter(signatures))
+        effective = shipping_total + extra_shipping - shipping_discount
+        if effective < 0:
+            issues.append(_issue(first, f"배송비 할인 후 금액이 음수입니다: {effective}"))
+            continue
+        charges.append(
+            ShippingCharge(
+                bundle_key=key,
+                order_no=first.order_no,
+                source_row=first.source_row,
+                shipping_total=shipping_total,
+                extra_shipping=extra_shipping,
+                shipping_discount=shipping_discount,
+                effective_amount=effective,
+            )
+        )
+    return charges
 
 
 def _append_line(
@@ -370,6 +484,10 @@ def write_ecount_workbook(
     voucher_date: date,
     manager_code: str = "00109",
 ) -> None:
+    if result.issues:
+        raise ValueError(f"확인 필요 항목 {len(result.issues)}건이 있어 전표를 저장할 수 없습니다.")
+    if not result.is_reconciled:
+        raise ValueError(f"금액 차이 {result.amount_difference:,.0f}원이 있어 전표를 저장할 수 없습니다.")
     workbook = Workbook()
     upload = workbook.active
     upload.title = "이카운트 웹입력"
@@ -383,7 +501,7 @@ def write_ecount_workbook(
         upload.append([
             date_number, None, line.customer_code, line.customer_name, manager_code, line.warehouse, None, None, None, None, None, None,
             line.item_code, line.item_name, None, float(line.quantity), float(line.unit_price), None,
-            f"=Q{index}/1.1*P{index}", f"=Q{index}*P{index}-S{index}", None, None,
+            f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}", None, None,
         ])
     _style_upload_sheet(upload, len(result.lines) + 1)
 
@@ -397,8 +515,22 @@ def write_ecount_workbook(
     review.append(["자동 변환행", len(result.lines)])
     review.append(["확인 필요행", len(result.issues)])
     review.append(["원본 품목금액", float(result.input_total)])
-    review.append(["전표 품목금액", float(result.output_total)])
-    review.append(["금액 차이", float(result.input_total - result.output_total)])
+    review.append(["제외 품목금액", float(result.excluded_total)])
+    review.append(["실제 배송비", float(result.shipping_total)])
+    review.append(["검수 기준금액", float(result.expected_output_total)])
+    review.append(["전표 총금액", float(result.output_total)])
+    review.append(["금액 차이", float(result.amount_difference)])
+    review.append([])
+    review.append(["배송비 묶음번호", "원배송비", "추가배송비", "할인액", "실제 배송비", "조정 여부"])
+    for charge in result.shipping_charges:
+        review.append([
+            charge.bundle_key,
+            float(charge.shipping_total),
+            float(charge.extra_shipping),
+            float(charge.shipping_discount),
+            float(charge.effective_amount),
+            "확인" if charge.is_adjusted else "일반",
+        ])
     _style_review_sheet(review)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
@@ -419,7 +551,7 @@ def _style_upload_sheet(sheet: Any, last_row: int) -> None:
         sheet.cell(row, 6).number_format = "@"
         sheet.cell(row, 13).number_format = "@"
         for column in (16, 17, 19, 20):
-            sheet.cell(row, column).number_format = "#,##0.00"
+            sheet.cell(row, column).number_format = "#,##0"
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = f"A1:V{max(last_row, 1)}"
 
@@ -430,4 +562,8 @@ def _style_review_sheet(sheet: Any) -> None:
         cell.font = Font(color="FFFFFF", bold=True)
     for column, width in {1: 12, 2: 10, 3: 22, 4: 70, 5: 10, 6: 14, 7: 45}.items():
         sheet.column_dimensions[get_column_letter(column)].width = width
+    for row in sheet.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, (int, float)):
+                cell.number_format = "#,##0"
     sheet.freeze_panes = "A2"
