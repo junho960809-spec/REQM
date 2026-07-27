@@ -12,6 +12,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCompleter,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -39,12 +40,15 @@ from PySide6.QtWidgets import (
 from supabase import ClientOptions, create_client
 
 from ecount_sales_core import (
+    combine_order_sources,
     ConversionResult,
     ReferenceCatalog,
     VoucherLine,
     convert_orders,
+    detect_smartstore_order_period,
     normalize_source,
-    read_smartstore_orders,
+    read_purchase_confirmed_orders,
+    read_smartstore_orders_range,
     write_ecount_workbook,
 )
 
@@ -209,6 +213,7 @@ class SetMappingDialog(QDialog):
         combo.setEditable(True)
         combo.setInsertPolicy(QComboBox.NoInsert)
         combo.addItem("품목코드 또는 품목명 검색", "")
+        completion_labels = []
         for code, item in sorted(self.items.items()):
             name = str(
                 item.get("representative_name")
@@ -216,7 +221,15 @@ class SetMappingDialog(QDialog):
                 or item.get("standard_name")
                 or code
             )
-            combo.addItem(f"{code} | {name}", code)
+            label = f"{code} | {name}"
+            combo.addItem(label, code)
+            completion_labels.append(label)
+        completer = QCompleter(completion_labels, combo)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        combo.setCompleter(completer)
+        combo.setToolTip("품목코드 또는 품목명의 일부를 입력하면 검색 결과가 표시됩니다.")
         selected = combo.findData(item_code)
         if selected >= 0:
             combo.setCurrentIndex(selected)
@@ -327,15 +340,20 @@ class SalesVoucherWindow(QMainWindow):
         self.current_result: ConversionResult | None = None
         self.file_path = QLineEdit()
         self.file_path.setPlaceholderText("스마트스토어에서 내려받은 원본 Excel을 선택하세요")
+        self.confirmed_file_path = QLineEdit()
+        self.confirmed_file_path.setPlaceholderText("구매확정 Excel을 선택하세요 (선택 사항)")
         self.email = QLineEdit()
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.Password)
         self.db_status = QLabel("DB 준비 중")
         self.order_date = QDateEdit(QDate.currentDate().addDays(-1))
+        self.order_end_date = QDateEdit(QDate.currentDate().addDays(-1))
         self.voucher_date = QDateEdit(QDate.currentDate())
         self.order_date.setCalendarPopup(True)
+        self.order_end_date.setCalendarPopup(True)
         self.voucher_date.setCalendarPopup(True)
         self.order_date.setFixedWidth(112)
+        self.order_end_date.setFixedWidth(112)
         self.voucher_date.setFixedWidth(112)
         self.manager_code = QLineEdit("00109")
         self.manager_code.setFixedWidth(self.manager_code.fontMetrics().horizontalAdvance("000000") + 24)
@@ -346,6 +364,8 @@ class SalesVoucherWindow(QMainWindow):
         self.summary_orders = QLabel("0")
         self.summary_lines = QLabel("0")
         self.summary_issues = QLabel("0")
+        self.summary_initial_total = QLabel("0원")
+        self.summary_final_total = QLabel("0원")
         self.summary_total = QLabel("0원")
         self.summary_shipping = QLabel("0원")
         self.summary_difference = QLabel("0원")
@@ -394,32 +414,41 @@ class SalesVoucherWindow(QMainWindow):
         options_layout.setVerticalSpacing(5)
         browse_button = QPushButton("원본 선택")
         browse_button.clicked.connect(self.choose_file)
+        confirmed_browse_button = QPushButton("구매확정 선택")
+        confirmed_browse_button.clicked.connect(self.choose_confirmed_file)
         analyze_button = QPushButton("분석 및 자동 매칭")
         analyze_button.setObjectName("primary")
         analyze_button.clicked.connect(self.analyze)
         options_layout.addWidget(QLabel("원본 파일"), 0, 0)
-        options_layout.addWidget(self.file_path, 0, 1, 1, 7)
-        options_layout.addWidget(browse_button, 0, 8)
-        options_layout.addWidget(QLabel("주문 대상일"), 1, 0)
-        options_layout.addWidget(self.order_date, 1, 1)
-        options_layout.addWidget(QLabel("전표 일자"), 1, 2)
-        options_layout.addWidget(self.voucher_date, 1, 3)
-        options_layout.addWidget(QLabel("담당자"), 1, 4)
-        options_layout.addWidget(self.manager_code, 1, 5)
-        options_layout.addWidget(QLabel("기본 창고"), 1, 6)
-        options_layout.addWidget(self.default_warehouse, 1, 7)
-        options_layout.addWidget(analyze_button, 1, 8)
+        options_layout.addWidget(self.file_path, 0, 1, 1, 9)
+        options_layout.addWidget(browse_button, 0, 10)
+        options_layout.addWidget(QLabel("구매확정 파일"), 1, 0)
+        options_layout.addWidget(self.confirmed_file_path, 1, 1, 1, 9)
+        options_layout.addWidget(confirmed_browse_button, 1, 10)
+        options_layout.addWidget(QLabel("주문 기간"), 2, 0)
+        options_layout.addWidget(self.order_date, 2, 1)
+        options_layout.addWidget(QLabel("~"), 2, 2)
+        options_layout.addWidget(self.order_end_date, 2, 3)
+        options_layout.addWidget(QLabel("전표 일자"), 2, 4)
+        options_layout.addWidget(self.voucher_date, 2, 5)
+        options_layout.addWidget(QLabel("담당자"), 2, 6)
+        options_layout.addWidget(self.manager_code, 2, 7)
+        options_layout.addWidget(QLabel("기본 창고"), 2, 8)
+        options_layout.addWidget(self.default_warehouse, 2, 9)
+        options_layout.addWidget(analyze_button, 2, 10)
         options_layout.setColumnStretch(1, 1)
         options_layout.setColumnStretch(3, 1)
-        options.setMaximumHeight(108)
+        options.setMaximumHeight(142)
         layout.addWidget(options)
 
         cards = QHBoxLayout()
         for label, widget, color in (
-            ("대상 주문행", self.summary_orders, "#1D4ED8"),
+            ("대상 주문행(원본+구매확정)", self.summary_orders, "#1D4ED8"),
             ("전표 품목행", self.summary_lines, "#047857"),
             ("확인 필요", self.summary_issues, "#B45309"),
-            ("전표 총액", self.summary_total, "#0F172A"),
+            ("합산 최초 상품금액", self.summary_initial_total, "#334155"),
+            ("합산 최종 상품금액", self.summary_final_total, "#0F766E"),
+            ("전표 총액(배송비 포함)", self.summary_total, "#0F172A"),
             ("전표 배송비", self.summary_shipping, "#7C3AED"),
             ("금액 차이", self.summary_difference, "#B91C1C"),
         ):
@@ -445,15 +474,33 @@ class SalesVoucherWindow(QMainWindow):
             self.lines_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.lines_table.setAlternatingRowColors(True)
         self.lines_table.setSortingEnabled(False)
-        tabs.addTab(self.lines_table, "자동 변환 결과")
+        result_tab = QWidget()
+        result_layout = QVBoxLayout(result_tab)
+        result_layout.setContentsMargins(5, 5, 5, 5)
+        result_layout.setSpacing(5)
+        result_search_layout = QHBoxLayout()
+        result_search_layout.addWidget(QLabel("품목 검색"))
+        self.result_search = QLineEdit()
+        self.result_search.setPlaceholderText("품목코드 또는 품목명의 일부를 입력하세요")
+        self.result_search.setClearButtonEnabled(True)
+        self.result_search.textChanged.connect(self.filter_result_lines)
+        result_search_layout.addWidget(self.result_search, 1)
+        self.result_filter_count = QLabel("전체 표시")
+        self.result_filter_count.setStyleSheet("color:#526D82;")
+        result_search_layout.addWidget(self.result_filter_count)
+        result_layout.addLayout(result_search_layout)
+        result_layout.addWidget(self.lines_table, 1)
+        tabs.addTab(result_tab, "자동 변환 결과")
 
-        self.issues_table.setHorizontalHeaderLabels(["원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"])
+        self.issues_table.setColumnCount(7)
+        self.issues_table.setHorizontalHeaderLabels(["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"])
         self.issues_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.issues_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.issues_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.issues_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.issues_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.issues_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.issues_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.issues_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.issues_table.cellDoubleClicked.connect(self.open_set_mapping_dialog)
         self.issues_table.setToolTip("확인 필요 항목을 더블클릭하면 Supabase 세트 품목과 금액을 연결할 수 있습니다.")
         tabs.addTab(self.issues_table, "확인 필요")
@@ -606,6 +653,26 @@ class SalesVoucherWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "스마트스토어 원본 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)")
         if path:
             self.file_path.setText(path)
+            try:
+                start_date, end_date = detect_smartstore_order_period(path)
+                self.order_date.setDate(QDate(start_date.year, start_date.month, start_date.day))
+                self.order_end_date.setDate(QDate(end_date.year, end_date.month, end_date.day))
+                self.db_status.setText(
+                    f"원본 주문 기간 자동 확인: {start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}"
+                )
+                self.db_status.setStyleSheet("color:#1D4ED8;font-weight:600;")
+            except Exception as exc:
+                QMessageBox.warning(self, "주문 기간 확인 실패", str(exc))
+
+    def choose_confirmed_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "스마트스토어 구매확정 파일 선택",
+            str(Path.home()),
+            "Excel 파일 (*.xlsx *.xlsm)",
+        )
+        if path:
+            self.confirmed_file_path.setText(path)
 
     def analyze(self) -> None:
         if self.catalog is None:
@@ -615,13 +682,29 @@ class SalesVoucherWindow(QMainWindow):
         if not source.exists():
             QMessageBox.information(self, "원본 파일", "스마트스토어 원본 Excel 파일을 선택해주세요.")
             return
-        order_date = self.order_date.date().toPython()
+        start_date = self.order_date.date().toPython()
+        end_date = self.order_end_date.date().toPython()
+        if end_date < start_date:
+            QMessageBox.warning(self, "주문 기간", "주문 종료일은 시작일보다 빠를 수 없습니다.")
+            return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            orders = read_smartstore_orders(source, order_date)
-            if not orders:
-                QMessageBox.information(self, "대상 없음", f"{order_date:%Y-%m-%d} 결제 주문을 찾지 못했습니다.")
+            original_orders = read_smartstore_orders_range(source, start_date, end_date)
+            if not original_orders:
+                QMessageBox.information(
+                    self,
+                    "대상 없음",
+                    f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d} 결제 주문을 찾지 못했습니다.",
+                )
                 return
+            confirmed_orders = []
+            confirmed_path_text = self.confirmed_file_path.text().strip()
+            if confirmed_path_text:
+                confirmed_source = Path(confirmed_path_text)
+                if not confirmed_source.exists():
+                    raise ValueError("선택한 구매확정 Excel 파일을 찾을 수 없습니다.")
+                confirmed_orders = read_purchase_confirmed_orders(confirmed_source)
+            orders = combine_order_sources(original_orders, confirmed_orders)
             self.current_result = convert_orders(orders, self.catalog, default_warehouse=str(self.default_warehouse.value()))
             self._show_result(self.current_result)
             self.export_button.setEnabled(bool(self.current_result.lines))
@@ -634,6 +717,8 @@ class SalesVoucherWindow(QMainWindow):
         self.summary_orders.setText(f"{len(result.orders):,}")
         self.summary_lines.setText(f"{len(result.lines):,}")
         self.summary_issues.setText(f"{len(result.issues):,}")
+        self.summary_initial_total.setText(f"{result.initial_item_total:,.0f}원")
+        self.summary_final_total.setText(f"{result.final_item_total:,.0f}원")
         self.summary_total.setText(f"{result.output_total:,.0f}원")
         self.summary_shipping.setText(f"{result.shipping_total:,.0f}원")
         self.summary_difference.setText(f"{result.amount_difference:,.0f}원")
@@ -668,14 +753,23 @@ class SalesVoucherWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.lines_table.setItem(row_index, column, item)
         self.lines_table.setSortingEnabled(False)
+        self.filter_result_lines(self.result_search.text())
 
         self.issues_table.setRowCount(len(result.issues))
         for row_index, issue in enumerate(result.issues):
-            values = [issue.source_row, issue.order_no, issue.product_name, issue.options, f"{issue.amount:,.0f}", issue.reason]
+            values = [
+                issue.source_type,
+                issue.source_row,
+                issue.order_no,
+                issue.product_name,
+                issue.options,
+                f"{issue.amount:,.0f}",
+                issue.reason,
+            ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                if column == 5:
+                if column == 6:
                     item.setBackground(QColor("#FDE68A"))
                 self.issues_table.setItem(row_index, column, item)
 
@@ -698,6 +792,27 @@ class SalesVoucherWindow(QMainWindow):
                 if charge.is_adjusted:
                     item.setBackground(QColor("#FED7AA"))
                 self.shipping_table.setItem(row_index, column, item)
+
+    def filter_result_lines(self, text: str) -> None:
+        keyword = (text or "").strip().casefold()
+        visible = 0
+        for row in range(self.lines_table.rowCount()):
+            item_code = self.lines_table.item(row, 0)
+            item_name = self.lines_table.item(row, 1)
+            searchable = " ".join(
+                (
+                    item_code.text() if item_code is not None else "",
+                    item_name.text() if item_name is not None else "",
+                )
+            ).casefold()
+            show = not keyword or keyword in searchable
+            self.lines_table.setRowHidden(row, not show)
+            if show:
+                visible += 1
+        if keyword:
+            self.result_filter_count.setText(f"{visible:,}/{self.lines_table.rowCount():,}행")
+        else:
+            self.result_filter_count.setText(f"전체 {self.lines_table.rowCount():,}행")
 
     def _apply_table_edits(self) -> None:
         assert self.current_result is not None
@@ -738,17 +853,24 @@ class SalesVoucherWindow(QMainWindow):
         if not selected_rows:
             QMessageBox.information(self, "선택 필요", "분석에서 삭제할 확인 필요 항목을 선택해주세요.")
             return
-        source_rows = {self.current_result.issues[row].source_row for row in selected_rows}
+        source_keys = {
+            (self.current_result.issues[row].source_type, self.current_result.issues[row].source_row)
+            for row in selected_rows
+        }
         answer = QMessageBox.question(
             self,
             "분석 항목 삭제",
-            f"선택한 {len(source_rows)}개 주문행을 이번 분석에서 제외할까요?\n원본 파일과 DB는 삭제되지 않습니다.",
+            f"선택한 {len(source_keys)}개 주문행을 이번 분석에서 제외할까요?\n입력 파일과 DB는 삭제되지 않습니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
-        remaining = [order for order in self.current_result.orders if order.source_row not in source_rows]
+        remaining = [
+            order
+            for order in self.current_result.orders
+            if (order.source_type, order.source_row) not in source_keys
+        ]
         self.current_result = convert_orders(
             remaining,
             self.catalog,
@@ -771,7 +893,11 @@ class SalesVoucherWindow(QMainWindow):
             return
         issue = self.current_result.issues[issue_row]
         order = next(
-            (row for row in self.current_result.orders if row.source_row == issue.source_row),
+            (
+                row
+                for row in self.current_result.orders
+                if row.source_row == issue.source_row and row.source_type == issue.source_type
+            ),
             None,
         )
         if order is None:
@@ -920,7 +1046,14 @@ class SalesVoucherWindow(QMainWindow):
         if issue.reason != "상품/옵션 조합이 DB에 없습니다.":
             QMessageBox.information(self, "단품 추가 불가", "DB 미등록 상품/옵션 항목만 단품으로 바로 추가할 수 있습니다.")
             return
-        order = next((row for row in self.current_result.orders if row.source_row == issue.source_row), None)
+        order = next(
+            (
+                row
+                for row in self.current_result.orders
+                if row.source_row == issue.source_row and row.source_type == issue.source_type
+            ),
+            None,
+        )
         if order is None:
             return
         item_code, ok = QInputDialog.getText(
@@ -993,8 +1126,10 @@ class SalesVoucherWindow(QMainWindow):
                 "금액 차이가 0원이 아니면 저장할 수 없습니다.",
             )
             return
-        order_day = self.order_date.date().toString("yyyyMMdd")
-        suggested = Path(self.file_path.text()).with_name(f"네이버_이카운트_판매전표_{order_day}.xlsx")
+        start_day = self.order_date.date().toString("yyyyMMdd")
+        end_day = self.order_end_date.date().toString("yyyyMMdd")
+        period = start_day if start_day == end_day else f"{start_day}~{end_day}"
+        suggested = Path(self.file_path.text()).with_name(f"네이버_이카운트_판매전표_{period}.xlsx")
         path, _ = QFileDialog.getSaveFileName(self, "이카운트 Excel 저장", str(suggested), "Excel 파일 (*.xlsx)")
         if not path:
             return

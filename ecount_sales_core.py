@@ -74,6 +74,10 @@ class SmartStoreOrder:
     shipping_total: Decimal = Decimal("0")
     extra_shipping: Decimal = Decimal("0")
     shipping_discount: Decimal = Decimal("0")
+    initial_item_total: Decimal | None = None
+    final_item_total: Decimal | None = None
+    source_type: str = "원본"
+    include_shipping: bool = True
 
     @property
     def normalized_source(self) -> str:
@@ -115,6 +119,7 @@ class ReviewIssue:
     quantity: Decimal
     amount: Decimal
     reason: str
+    source_type: str = "원본"
 
 
 @dataclass
@@ -142,6 +147,46 @@ class ConversionResult:
     @property
     def input_total(self) -> Decimal:
         return sum((row.item_total for row in self.orders), Decimal("0"))
+
+    @property
+    def initial_item_total(self) -> Decimal:
+        return sum(
+            (
+                row.initial_item_total
+                if row.initial_item_total is not None
+                else row.item_total
+                for row in self.orders
+            ),
+            Decimal("0"),
+        )
+
+    @property
+    def final_item_total(self) -> Decimal:
+        return sum(
+            (
+                row.final_item_total
+                if row.final_item_total is not None
+                else row.item_total
+                for row in self.orders
+            ),
+            Decimal("0"),
+        )
+
+    @property
+    def original_order_count(self) -> int:
+        return sum(1 for row in self.orders if row.source_type == "원본")
+
+    @property
+    def confirmed_order_count(self) -> int:
+        return sum(1 for row in self.orders if row.source_type == "구매확정")
+
+    @property
+    def original_item_total(self) -> Decimal:
+        return sum((row.item_total for row in self.orders if row.source_type == "원본"), Decimal("0"))
+
+    @property
+    def confirmed_item_total(self) -> Decimal:
+        return sum((row.item_total for row in self.orders if row.source_type == "구매확정"), Decimal("0"))
 
     @property
     def output_total(self) -> Decimal:
@@ -240,7 +285,48 @@ class ReferenceCatalog:
         )
 
 
+def detect_smartstore_order_period(path: str | Path) -> tuple[date, date]:
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook["구매확정내역"] if "구매확정내역" in workbook.sheetnames else workbook.worksheets[0]
+        rows = worksheet.iter_rows(values_only=True)
+        payment_index: int | None = None
+        header_row = 0
+        for row_number, row in enumerate(rows, start=1):
+            names = [str(value or "").strip() for value in row]
+            if "결제일" in names:
+                payment_index = names.index("결제일")
+                header_row = row_number
+                break
+            if row_number >= 30:
+                break
+        if payment_index is None:
+            raise ValueError("스마트스토어 헤더(결제일)를 찾지 못했습니다.")
+        paid_dates: list[date] = []
+        for row in rows:
+            if payment_index >= len(row):
+                continue
+            paid_at = parse_excel_date(row[payment_index])
+            if paid_at is not None:
+                paid_dates.append(paid_at.date())
+        if not paid_dates:
+            raise ValueError(f"{header_row}행 이후에서 유효한 결제일을 찾지 못했습니다.")
+        return min(paid_dates), max(paid_dates)
+    finally:
+        workbook.close()
+
+
 def read_smartstore_orders(path: str | Path, target_date: date) -> list[SmartStoreOrder]:
+    return read_smartstore_orders_range(path, target_date, target_date)
+
+
+def read_smartstore_orders_range(
+    path: str | Path,
+    start_date: date,
+    end_date: date,
+) -> list[SmartStoreOrder]:
+    if end_date < start_date:
+        raise ValueError("주문 종료일은 시작일보다 빠를 수 없습니다.")
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         worksheet = workbook["구매확정내역"] if "구매확정내역" in workbook.sheetnames else workbook.worksheets[0]
@@ -264,11 +350,23 @@ def read_smartstore_orders(path: str | Path, target_date: date) -> list[SmartSto
             if not any(value not in (None, "") for value in row):
                 continue
             paid_at = parse_excel_date(row[indexes["결제일"]])
-            if paid_at is None or paid_at.date() != target_date:
+            if paid_at is None or not (start_date <= paid_at.date() <= end_date):
                 continue
             quantity = as_decimal(row[indexes["수량"]])
             if quantity <= 0:
                 continue
+            initial_amount = (
+                as_decimal(row[indexes["최초 상품별 총 주문금액"]])
+                if "최초 상품별 총 주문금액" in indexes
+                and row[indexes["최초 상품별 총 주문금액"]] not in (None, "")
+                else None
+            )
+            final_amount = (
+                as_decimal(row[indexes["최종 상품별 총 주문금액"]])
+                if "최종 상품별 총 주문금액" in indexes
+                and row[indexes["최종 상품별 총 주문금액"]] not in (None, "")
+                else None
+            )
             amount = Decimal("0")
             for field_name in ("최종 상품별 총 주문금액", "최초 상품별 총 주문금액"):
                 if field_name in indexes and row[indexes[field_name]] not in (None, ""):
@@ -294,11 +392,122 @@ def read_smartstore_orders(path: str | Path, target_date: date) -> list[SmartSto
                     shipping_total=as_decimal(row[indexes["배송비 합계"]]) if "배송비 합계" in indexes else Decimal("0"),
                     extra_shipping=as_decimal(row[indexes["제주/도서 추가배송비"]]) if "제주/도서 추가배송비" in indexes else Decimal("0"),
                     shipping_discount=as_decimal(row[indexes["배송비 할인액"]]) if "배송비 할인액" in indexes else Decimal("0"),
+                    initial_item_total=initial_amount,
+                    final_item_total=final_amount,
                 )
             )
         return result
     finally:
         workbook.close()
+
+
+def read_purchase_confirmed_orders(path: str | Path) -> list[SmartStoreOrder]:
+    """구매확정 파일의 모든 품목행과 배송비를 읽는다."""
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook["구매확정내역"] if "구매확정내역" in workbook.sheetnames else workbook.worksheets[0]
+        rows = worksheet.iter_rows(values_only=True)
+        header: list[str] | None = None
+        header_row = 0
+        required = {
+            "상품주문번호",
+            "주문번호",
+            "구매확정일",
+            "상품명",
+            "옵션정보",
+            "수량",
+            "최초 상품별 총 주문금액",
+        }
+        for row_number, row in enumerate(rows, start=1):
+            names = [str(value or "").strip() for value in row]
+            if required.issubset(set(names)):
+                header = names
+                header_row = row_number
+                break
+            if row_number >= 30:
+                break
+        if header is None:
+            raise ValueError(
+                "구매확정 파일 헤더(상품주문번호/주문번호/구매확정일/상품명/옵션정보/수량/"
+                "최초 상품별 총 주문금액)를 찾지 못했습니다."
+            )
+        indexes = {name: index for index, name in enumerate(header)}
+        result: list[SmartStoreOrder] = []
+        for source_row, row in enumerate(rows, start=header_row + 1):
+            if not any(value not in (None, "") for value in row):
+                continue
+            quantity = as_decimal(row[indexes["수량"]])
+            if quantity <= 0:
+                continue
+            confirmed_at = parse_excel_date(row[indexes["구매확정일"]])
+            if confirmed_at is None:
+                raise ValueError(f"구매확정 파일 {source_row}행의 구매확정일을 읽을 수 없습니다.")
+            amount = as_decimal(row[indexes["최초 상품별 총 주문금액"]])
+            result.append(
+                SmartStoreOrder(
+                    source_row=source_row,
+                    order_no=clean_identifier(row[indexes["주문번호"]]),
+                    product_order_no=clean_identifier(row[indexes["상품주문번호"]]),
+                    paid_at=confirmed_at,
+                    status=str(row[indexes.get("주문상태", indexes["주문번호"])] or ""),
+                    product_name=str(row[indexes["상품명"]] or "").strip(),
+                    options=str(row[indexes["옵션정보"]] or "").strip(),
+                    quantity=quantity,
+                    item_total=amount,
+                    shipping_bundle_no=(
+                        clean_identifier(row[indexes["배송비 묶음번호"]])
+                        if "배송비 묶음번호" in indexes
+                        else ""
+                    ),
+                    shipping_total=(
+                        as_decimal(row[indexes["배송비 합계"]])
+                        if "배송비 합계" in indexes
+                        else Decimal("0")
+                    ),
+                    extra_shipping=(
+                        as_decimal(row[indexes["제주/도서 추가배송비"]])
+                        if "제주/도서 추가배송비" in indexes
+                        else Decimal("0")
+                    ),
+                    shipping_discount=(
+                        as_decimal(row[indexes["배송비 할인액"]])
+                        if "배송비 할인액" in indexes
+                        else Decimal("0")
+                    ),
+                    initial_item_total=amount,
+                    final_item_total=amount,
+                    source_type="구매확정",
+                    include_shipping=True,
+                )
+            )
+        if not result:
+            raise ValueError("구매확정 파일에서 유효한 품목행을 찾지 못했습니다.")
+        return result
+    finally:
+        workbook.close()
+
+
+def combine_order_sources(
+    original_orders: list[SmartStoreOrder],
+    confirmed_orders: list[SmartStoreOrder],
+) -> list[SmartStoreOrder]:
+    """두 입력 파일을 합치며 상품주문번호 중복은 금액 이중계상 방지를 위해 차단한다."""
+    original_keys = {row.product_order_no for row in original_orders if row.product_order_no}
+    duplicate_keys = sorted(
+        {
+            row.product_order_no
+            for row in confirmed_orders
+            if row.product_order_no and row.product_order_no in original_keys
+        }
+    )
+    if duplicate_keys:
+        preview = ", ".join(duplicate_keys[:5])
+        suffix = "" if len(duplicate_keys) <= 5 else f" 외 {len(duplicate_keys) - 5}건"
+        raise ValueError(
+            f"원본과 구매확정 파일에 같은 상품주문번호가 {len(duplicate_keys)}건 있습니다: "
+            f"{preview}{suffix}. 금액 이중계상을 막기 위해 분석을 중단했습니다."
+        )
+    return [*original_orders, *confirmed_orders]
 
 
 def convert_orders(
@@ -441,6 +650,8 @@ def _collect_shipping_charges(
 ) -> list[ShippingCharge]:
     grouped: dict[str, list[SmartStoreOrder]] = defaultdict(list)
     for order in orders:
+        if not order.include_shipping:
+            continue
         key = order.shipping_bundle_no or order.order_no
         if key:
             grouped[key].append(order)
@@ -582,7 +793,16 @@ def _append_review_line(
 
 
 def _issue(order: SmartStoreOrder, reason: str) -> ReviewIssue:
-    return ReviewIssue(order.source_row, order.order_no, order.product_name, order.options, order.quantity, order.item_total, reason)
+    return ReviewIssue(
+        order.source_row,
+        order.order_no,
+        order.product_name,
+        order.options,
+        order.quantity,
+        order.item_total,
+        reason,
+        order.source_type,
+    )
 
 
 def write_ecount_workbook(
@@ -613,15 +833,21 @@ def write_ecount_workbook(
     _style_upload_sheet(upload, result.lines)
 
     review = workbook.create_sheet("검수결과")
-    review.append(["구분", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
+    review.append(["구분", "입력파일", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
     for issue in result.issues:
-        review.append(["확인필요", issue.source_row, issue.order_no, f"{issue.product_name} / {issue.options}", float(issue.quantity), float(issue.amount), issue.reason])
+        review.append(["확인필요", issue.source_type, issue.source_row, issue.order_no, f"{issue.product_name} / {issue.options}", float(issue.quantity), float(issue.amount), issue.reason])
     review.append([])
     review.append(["검수 항목", "결과"])
     review.append(["대상 주문행", len(result.orders)])
+    review.append(["원본 주문행", result.original_order_count])
+    review.append(["구매확정 주문행", result.confirmed_order_count])
     review.append(["자동 변환행", len(result.lines)])
     review.append(["확인 필요행", len(result.issues)])
     review.append(["원본 품목금액", float(result.input_total)])
+    review.append(["원본 파일 상품금액", float(result.original_item_total)])
+    review.append(["구매확정 파일 상품금액", float(result.confirmed_item_total)])
+    review.append(["최초 상품금액", float(result.initial_item_total)])
+    review.append(["최종 상품금액", float(result.final_item_total)])
     review.append(["제외 품목금액", float(result.excluded_total)])
     review.append(["전표 배송비(할인 미차감)", float(result.shipping_total)])
     review.append(["검수 기준금액", float(result.expected_output_total)])
@@ -673,7 +899,7 @@ def _style_review_sheet(sheet: Any) -> None:
     for cell in sheet[1]:
         cell.fill = PatternFill("solid", fgColor="1F4E78")
         cell.font = Font(color="FFFFFF", bold=True)
-    for column, width in {1: 12, 2: 10, 3: 22, 4: 70, 5: 10, 6: 14, 7: 45}.items():
+    for column, width in {1: 12, 2: 12, 3: 10, 4: 22, 5: 70, 6: 10, 7: 14, 8: 45}.items():
         sheet.column_dimensions[get_column_letter(column)].width = width
     for row in sheet.iter_rows():
         for cell in row:

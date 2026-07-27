@@ -9,10 +9,14 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from ecount_sales_core import (
+    combine_order_sources,
     ReferenceCatalog,
     SmartStoreOrder,
     convert_orders,
+    detect_smartstore_order_period,
+    read_purchase_confirmed_orders,
     read_smartstore_orders,
+    read_smartstore_orders_range,
     write_ecount_workbook,
 )
 
@@ -181,6 +185,99 @@ class SalesCoreTests(unittest.TestCase):
         )
         self.assertEqual(result.output_total, Decimal("257800.00"))
         self.assertTrue(result.is_reconciled)
+
+    def test_order_period_is_detected_and_all_dates_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "period.xlsx"
+            from openpyxl import Workbook
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "배송현황관리"
+            sheet.append([
+                "상품주문번호", "주문번호", "상품명", "옵션정보", "수량", "결제일", "주문상태",
+                "최종 상품별 총 주문금액", "최초 상품별 총 주문금액",
+            ])
+            for index, paid_date in enumerate(("2026-07-24", "2026-07-25", "2026-07-26"), start=1):
+                sheet.append([
+                    f"P{index}", f"O{index}", "상품 세트", "옵션 핑크", 1, paid_date, "구매확정",
+                    34900, 34900,
+                ])
+            workbook.save(source)
+            workbook.close()
+
+            self.assertEqual(
+                detect_smartstore_order_period(source),
+                (date(2026, 7, 24), date(2026, 7, 26)),
+            )
+            orders = read_smartstore_orders_range(
+                source,
+                date(2026, 7, 24),
+                date(2026, 7, 26),
+            )
+            self.assertEqual(len(orders), 3)
+            self.assertEqual(sum(order.item_total for order in orders), Decimal("104700.00"))
+
+    def test_purchase_confirmed_amount_and_shipping_are_added(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "confirmed.xlsx"
+            from openpyxl import Workbook
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "구매확정내역"
+            sheet.append([
+                "상품주문번호", "주문번호", "구매확정일", "주문상태", "상품명", "옵션정보", "수량",
+                "최초 상품별 총 주문금액", "배송비 묶음번호", "배송비 합계",
+            ])
+            sheet.append([
+                "CONFIRMED-P1", "CONFIRMED-O1", "2026-07-27", "구매확정", "상품 세트", "옵션 핑크", 2,
+                69800, "CONFIRMED-SHIP", 3000,
+            ])
+            workbook.save(source)
+            workbook.close()
+
+            confirmed = read_purchase_confirmed_orders(source)
+            self.assertEqual(len(confirmed), 1)
+            self.assertEqual(confirmed[0].source_type, "구매확정")
+            self.assertEqual(confirmed[0].item_total, Decimal("69800.00"))
+            self.assertTrue(confirmed[0].include_shipping)
+            self.assertEqual(confirmed[0].shipping_total, Decimal("3000.00"))
+
+            result = convert_orders(confirmed, self.catalog)
+            self.assertEqual(result.confirmed_order_count, 1)
+            self.assertEqual(result.confirmed_item_total, Decimal("69800.00"))
+            self.assertEqual(result.shipping_total, Decimal("3000.00"))
+            self.assertEqual(result.output_total, Decimal("72800.00"))
+            self.assertTrue(result.is_reconciled)
+
+    def test_duplicate_product_order_between_files_is_rejected(self) -> None:
+        original = SmartStoreOrder(
+            source_row=2,
+            order_no="O1",
+            product_order_no="P1",
+            paid_at=datetime(2026, 7, 24),
+            status="배송완료",
+            product_name="상품 세트",
+            options="옵션 핑크",
+            quantity=Decimal("1"),
+            item_total=Decimal("34900"),
+        )
+        confirmed = SmartStoreOrder(
+            source_row=2,
+            order_no="O1",
+            product_order_no="P1",
+            paid_at=datetime(2026, 7, 27),
+            status="구매확정",
+            product_name="상품 세트",
+            options="옵션 핑크",
+            quantity=Decimal("1"),
+            item_total=Decimal("34900"),
+            source_type="구매확정",
+            include_shipping=False,
+        )
+        with self.assertRaisesRegex(ValueError, "금액 이중계상"):
+            combine_order_sources([original], [confirmed])
 
 
 if __name__ == "__main__":
