@@ -40,11 +40,12 @@ from excel_loader import COLUMN_ALIASES, load_orders, suggest_header_row
 from matcher import ProductMatcher
 from matcher import compact
 from matcher import order_source_text
-from shipping_export import export_wekep
+from shipping_export import export_with_format
 from duty_free_loader import load_duty_free, match_barcodes
 from catalog_import import compare_catalog, load_item_catalog
 from location_store import load_locations, save_locations
 from format_store import upsert_format
+from output_format_store import delete_output_format, load_output_formats, save_custom_output_format
 from direct_suggester import component_payload, components_text, suggest_direct_order
 
 
@@ -55,7 +56,7 @@ DEFAULT_CONFIG = {
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.18"
+APP_VERSION = "1.0.20"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -568,6 +569,145 @@ class FileFormatDialog(QDialog):
         super().accept()
 
 
+class OutputFormatDialog(QDialog):
+    """Register an Excel file as a reusable shipping output template."""
+    FIELD_LABELS = (
+        ("order_number", "주문번호"),
+        ("channel", "판매처"),
+        ("product_name", "상품명 *"),
+        ("options", "옵션명"),
+        ("quantity", "수량 *"),
+        ("recipient", "수령자 *"),
+        ("phone", "핸드폰 *"),
+        ("zipcode", "우편번호 *"),
+        ("address", "주소 *"),
+        ("message", "배송메세지"),
+        ("serial_number", "일련번호"),
+    )
+    REQUIRED_KEYS = {"product_name", "quantity", "recipient", "phone", "zipcode", "address"}
+
+    def __init__(self, file_path: str, parent=None):
+        super().__init__(parent)
+        self.profile: dict = {}
+        self.file_path = file_path
+        self.header_row, headers = suggest_header_row(file_path)
+        self.headers = [header for header in headers if header]
+        self.setWindowTitle("새 출력 양식 등록")
+        self.resize(620, 620)
+        self.name_edit = QLineEdit(Path(file_path).stem)
+        self.combos: dict[str, QComboBox] = {}
+        aliases = {
+            "order_number": ["주문번호"],
+            "channel": ["판매처", "판매처명"],
+            "product_name": ["상품명", "품목명"],
+            "options": ["옵션명", "옵션", "상품옵션"],
+            "quantity": ["수량", "주문수량"],
+            "recipient": ["수령자", "수령인", "수취인"],
+            "phone": ["핸드폰", "휴대폰", "연락처"],
+            "zipcode": ["우편번호"],
+            "address": ["주소", "수령자주소"],
+            "message": ["배송메세지", "배송메시지"],
+            "serial_number": ["일련번호"],
+        }
+        form = QFormLayout()
+        form.addRow("양식 이름 *", self.name_edit)
+        for key, label in self.FIELD_LABELS:
+            combo = QComboBox()
+            combo.addItem("(사용 안 함)", "")
+            for header in self.headers:
+                combo.addItem(header, header)
+            normalized = {"".join(value.lower().split()) for value in aliases.get(key, [])}
+            selected = next(
+                (index for index, header in enumerate(self.headers, start=1)
+                 if "".join(header.lower().split()) in normalized),
+                0,
+            )
+            combo.setCurrentIndex(selected)
+            self.combos[key] = combo
+            form.addRow(label, combo)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("출력 양식 저장")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"{self.header_row + 1}행을 제목 행으로 찾았습니다. 변환 결과를 넣을 열을 연결하세요.\n"
+            "등록한 양식은 다음 실행에서도 다시 선택할 수 있습니다."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        name = self.name_edit.text().strip()
+        selected = {key: str(combo.currentData() or "") for key, combo in self.combos.items()}
+        missing = [key for key in self.REQUIRED_KEYS if not selected.get(key)]
+        if not name or missing:
+            QMessageBox.warning(self, "필수 연결", "양식 이름과 별표(*) 항목을 모두 연결하세요.")
+            return
+        mapping = {key: header for key, header in selected.items() if header}
+        self.profile = save_custom_output_format(name, self.file_path, self.header_row, mapping)
+        super().accept()
+
+
+class OutputFormatManagerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("출력 양식 관리")
+        self.resize(560, 410)
+        self.list_widget = QListWidget()
+        add_button = QPushButton("Excel 양식 추가")
+        delete_button = QPushButton("선택 양식 삭제")
+        close_button = QPushButton("완료")
+        buttons = QHBoxLayout()
+        buttons.addWidget(add_button)
+        buttons.addWidget(delete_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout = QVBoxLayout(self)
+        intro = QLabel("변환 결과로 사용할 Excel 양식을 등록하고 관리합니다. 기본 제공 양식은 삭제할 수 없습니다.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        layout.addWidget(self.list_widget)
+        layout.addLayout(buttons)
+        add_button.clicked.connect(self.add_format)
+        delete_button.clicked.connect(self.delete_selected)
+        close_button.clicked.connect(self.accept)
+        self.refresh()
+
+    def refresh(self, selected_id: str = "") -> None:
+        self.formats = load_output_formats()
+        self.list_widget.clear()
+        for index, profile in enumerate(self.formats):
+            label = profile["name"] + (" · 기본 제공" if profile.get("builtin") else " · 사용자 등록")
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, profile["id"])
+            self.list_widget.addItem(item)
+            if profile["id"] == selected_id:
+                self.list_widget.setCurrentRow(index)
+
+    def add_format(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "출력 Excel 양식 선택", "", "Excel 파일 (*.xlsx)")
+        if not path:
+            return
+        dialog = OutputFormatDialog(path, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh(dialog.profile.get("id", ""))
+
+    def delete_selected(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        profile_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        profile = next((row for row in self.formats if row.get("id") == profile_id), None)
+        if not profile or profile.get("builtin"):
+            QMessageBox.information(self, "기본 양식", "기본 제공 출력 양식은 삭제할 수 없습니다.")
+            return
+        delete_output_format(profile_id)
+        self.refresh()
+
+
 class DirectSuggestionDialog(QDialog):
     def __init__(self, orders: list[dict], items: list[dict], parent=None):
         super().__init__(parent)
@@ -922,6 +1062,9 @@ class MainWindow(QMainWindow):
         self.export_button = QPushButton("택배 출고용 변환")
         self.export_button.setObjectName("exportButton")
         self.export_button.setEnabled(False)
+        self.output_format_combo = QComboBox()
+        self.output_format_combo.setMinimumWidth(220)
+        self.output_format_manage_button = QPushButton("출력 양식 관리")
         self.status = QLabel("공개용 API 키 설정 후 연결을 확인하세요.")
         self.status.setObjectName("statusCard")
         self.status.setWordWrap(True)
@@ -1023,6 +1166,9 @@ class MainWindow(QMainWindow):
         layout.addLayout(analysis_header_row)
         layout.addWidget(self.table, 1)
         export_row = QHBoxLayout()
+        export_row.addWidget(QLabel("변환 출력 양식"))
+        export_row.addWidget(self.output_format_combo)
+        export_row.addWidget(self.output_format_manage_button)
         export_row.addStretch(1)
         export_row.addWidget(self.export_button)
         layout.addLayout(export_row)
@@ -1040,10 +1186,29 @@ class MainWindow(QMainWindow):
         self.auto_button.clicked.connect(lambda: self.select_file("auto"))
         self.db_button.clicked.connect(self.open_db_manager)
         self.export_button.clicked.connect(self.export_file)
+        self.output_format_manage_button.clicked.connect(self.manage_output_formats)
         self.location_manage_button.clicked.connect(self.manage_locations)
         self.location_apply_button.clicked.connect(self.apply_location)
         self.table.cellDoubleClicked.connect(self.edit_match)
         self.refresh_location_combo()
+        self.refresh_output_formats()
+
+    def refresh_output_formats(self, selected_id: str = "") -> None:
+        selected_id = selected_id or str(self.output_format_combo.currentData() or "default_b2c")
+        self.output_formats = load_output_formats()
+        self.output_format_combo.clear()
+        selected_index = 0
+        for index, profile in enumerate(self.output_formats):
+            self.output_format_combo.addItem(profile["name"], profile["id"])
+            if profile["id"] == selected_id:
+                selected_index = index
+        self.output_format_combo.setCurrentIndex(selected_index)
+
+    def manage_output_formats(self) -> None:
+        selected_id = str(self.output_format_combo.currentData() or "default_b2c")
+        dialog = OutputFormatManagerDialog(self)
+        dialog.exec()
+        self.refresh_output_formats(selected_id)
 
     def refresh_location_combo(self, preferred_channel: str = "") -> None:
         selected_id = self.location_combo.currentData() if hasattr(self, "location_combo") else ""
@@ -1625,7 +1790,13 @@ class MainWindow(QMainWindow):
         if not file_path.lower().endswith(".xlsx"):
             file_path += ".xlsx"
         try:
-            export_wekep(self.current_orders, file_path)
+            selected_id = str(self.output_format_combo.currentData() or "default_b2c")
+            available_formats = load_output_formats()
+            profile = next(
+                (row for row in available_formats if str(row.get("id")) == selected_id),
+                available_formats[0],
+            )
+            export_with_format(self.current_orders, file_path, profile)
         except Exception as exc:
             QMessageBox.critical(self, "Excel 저장 실패", str(exc))
             return

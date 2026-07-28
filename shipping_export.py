@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from openpyxl import Workbook
+from copy import copy
+
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
@@ -47,3 +49,62 @@ def export_wekep(orders: list[dict[str, str]], file_path: str) -> None:
         for cell in row:
             cell.alignment = Alignment(vertical="center", wrap_text=True)
     workbook.save(Path(file_path))
+
+
+def export_with_format(orders: list[dict[str, str]], file_path: str, profile: dict) -> None:
+    if profile.get("id") == "default_b2c":
+        export_wekep(orders, file_path)
+        return
+
+    template_path = str(profile.get("template_path", ""))
+    if template_path:
+        workbook = load_workbook(template_path)
+        sheet = workbook.active
+        header_row = int(profile.get("header_row", 0)) + 1
+        headers = [cell.value for cell in sheet[header_row]]
+    else:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "B2C 사입형"
+        headers = list(profile.get("headers") or [])
+        sheet.append(headers)
+        header_row = 1
+        fill = PatternFill("solid", fgColor="FFA395")
+        for index in (3, 5, 8, 10, 11, 12):
+            sheet.cell(header_row, index).fill = fill
+        for cell in sheet[header_row]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    header_positions = {
+        str(value).strip(): index for index, value in enumerate(headers, start=1) if value is not None
+    }
+    mapping = dict(profile.get("mapping") or {})
+    missing_headers = [header for header in mapping.values() if header not in header_positions]
+    if missing_headers:
+        workbook.close()
+        raise ValueError("출력 양식에서 연결된 열을 찾지 못했습니다: " + ", ".join(missing_headers))
+
+    start_row = header_row + 1
+    template_style_row = start_row
+    if template_path:
+        for row_index in range(start_row, sheet.max_row + 1):
+            for header in mapping.values():
+                sheet.cell(row_index, header_positions[header]).value = None
+    for row_index, order in enumerate(orders, start=start_row):
+        if row_index > start_row and template_path:
+            for column in range(1, max(len(headers), 1) + 1):
+                source = sheet.cell(template_style_row, column)
+                target = sheet.cell(row_index, column)
+                if source.has_style:
+                    target._style = copy(source._style)
+                if source.number_format:
+                    target.number_format = source.number_format
+        for key, header in mapping.items():
+            value = order.get(key, "")
+            if key == "product_name":
+                value = order.get("matched_product") or order.get("matched_name") or value
+            sheet.cell(row_index, header_positions[header]).value = value
+
+    workbook.save(Path(file_path))
+    workbook.close()

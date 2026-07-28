@@ -32,6 +32,24 @@ COLUMN_ALIASES = {
 
 REQUIRED = {"order_number", "recipient", "product_name", "quantity"}
 
+B2C_PURCHASE_FORMAT = "B2C 사입형 출고건"
+B2C_PURCHASE_HEADERS = {
+    "상품명": "product_name",
+    "수량": "quantity",
+    "수령자": "recipient",
+    "핸드폰": "phone",
+    "우편번호": "zipcode",
+    "주소": "address1",
+}
+B2C_PURCHASE_REQUIRED_VALUES = {
+    "product_name": "상품명(C)",
+    "quantity": "수량(E)",
+    "recipient": "수령자(H)",
+    "phone": "핸드폰(J)",
+    "zipcode": "우편번호(K)",
+    "address1": "주소(L)",
+}
+
 
 def _clean(value: Any) -> str:
     if value is None:
@@ -49,8 +67,11 @@ def _read_rows(path: Path) -> list[list[Any]]:
         return [[sheet.cell_value(r, c) for c in range(sheet.ncols)] for r in range(sheet.nrows)]
     if suffix == ".xlsx":
         book = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = book.active
-        return [list(row) for row in sheet.iter_rows(values_only=True)]
+        try:
+            sheet = book.active
+            return [list(row) for row in sheet.iter_rows(values_only=True)]
+        finally:
+            book.close()
     if suffix == ".csv":
         for encoding in ("utf-8-sig", "cp949"):
             try:
@@ -104,6 +125,30 @@ def _find_header(rows: list[list[Any]], profile: dict[str, Any] | None = None) -
         if not found:
             raise ValueError(f"저장된 '{profile.get('name', '')}' 양식의 필수 열을 찾지 못했습니다.")
         return found[0], found[1], str(profile.get("name", "사용자 양식"))
+
+    # 위킵 B2C 사입형은 주문번호가 선택값이고, 색칠된 C/E/H/J/K/L 열만
+    # 필수값이다. 일반 B2C의 필수 주문번호 검사보다 먼저 전용 양식을 판별한다.
+    for row_index, row in enumerate(rows[:50]):
+        headers = {_normalize_header(value): index for index, value in enumerate(row) if _clean(value)}
+        if not all(_normalize_header(header) in headers for header in B2C_PURCHASE_HEADERS):
+            continue
+        columns = {
+            key: headers[_normalize_header(header)]
+            for header, key in B2C_PURCHASE_HEADERS.items()
+        }
+        optional_headers = {
+            "주문번호": "order_number",
+            "옵션명": "option1",
+            "배송메세지": "message",
+        }
+        columns.update(
+            {
+                key: headers[_normalize_header(header)]
+                for header, key in optional_headers.items()
+                if _normalize_header(header) in headers
+            }
+        )
+        return row_index, columns, B2C_PURCHASE_FORMAT
 
     for saved in load_formats():
         found = _profile_columns(rows, saved)
@@ -194,6 +239,16 @@ def load_orders(file_path: str, profile: dict[str, Any] | None = None) -> tuple[
         product_name = get("product_name")
         if not order_number and not product_name:
             continue
+        if format_name == B2C_PURCHASE_FORMAT:
+            missing_values = [
+                label for key, label in B2C_PURCHASE_REQUIRED_VALUES.items()
+                if not get(key)
+            ]
+            if missing_values:
+                raise ValueError(
+                    f"{B2C_PURCHASE_FORMAT} {source_row}행 필수값 누락: "
+                    + ", ".join(missing_values)
+                )
         options = " / ".join(filter(None, [get("option1"), get("option2"), get("option3")]))
         address = " ".join(filter(None, [get("address1"), get("address2")]))
         manual_items = []
@@ -204,7 +259,9 @@ def load_orders(file_path: str, profile: dict[str, Any] | None = None) -> tuple[
             ]
         matched_name = " / ".join(filter(None, [get("match1"), get("match2"), *manual_items]))
         channel = get("channel")
-        if format_name == "판매처 직접파일 · 이알아이":
+        if format_name == B2C_PURCHASE_FORMAT:
+            channel = B2C_PURCHASE_FORMAT
+        elif format_name == "판매처 직접파일 · 이알아이":
             channel = "이알아이"
         elif format_name == "판매처 직접파일 · 쌤몰":
             channel = "쌤몰"
