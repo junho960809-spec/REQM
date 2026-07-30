@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import sys
@@ -43,6 +44,7 @@ from ecount_sales_core import (
     combine_order_sources,
     ConversionResult,
     ReferenceCatalog,
+    SmartStoreOrder,
     VoucherLine,
     convert_orders,
     detect_smartstore_order_period,
@@ -50,6 +52,7 @@ from ecount_sales_core import (
     read_purchase_confirmed_orders,
     read_smartstore_orders_range,
     write_ecount_workbook,
+    write_ecount_lines_workbook,
 )
 
 
@@ -58,6 +61,67 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_DIR))
 LOCAL_DATA_DIR = BUNDLE_DIR / "supabase" / "ecount_migration" / "data"
 DB_LOG_PATH = APP_DIR / "db_connection.log"
+SPECIAL_ITEMS_PATH = APP_DIR / "special_warehouse_items.json"
+DELETED_ITEMS_PATH = APP_DIR / "deleted_db_items.json"
+
+
+def load_code_set(path: Path) -> set[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return {str(value).strip() for value in data if str(value).strip()}
+    except Exception:
+        return set()
+
+
+def save_code_set(path: Path, values: set[str]) -> None:
+    path.write_text(
+        json.dumps(sorted(values), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def catalog_without_items(catalog: ReferenceCatalog, deleted_codes: set[str]) -> ReferenceCatalog:
+    if not deleted_codes:
+        return catalog
+    deleted = {code.casefold() for code in deleted_codes}
+    items = [
+        row for row in catalog.item_rows
+        if str(row.get("item_code") or "").casefold() not in deleted
+    ]
+    invalid_mapping_keys = {
+        str(row.get("mapping_key") or "") for row in catalog.mapping_component_rows
+        if str(row.get("item_code") or "").casefold() in deleted
+    }
+    mapping_components = [
+        row for row in catalog.mapping_component_rows
+        if str(row.get("mapping_key") or "") not in invalid_mapping_keys
+    ]
+    valid_mapping_keys = {str(row.get("mapping_key") or "") for row in mapping_components}
+    mappings = [
+        row for row in catalog.mapping_rows
+        if str(row.get("mapping_key") or "") in valid_mapping_keys
+    ]
+    invalid_rule_keys = {
+        str(row.get("price_rule_key") or "") for row in catalog.price_component_rows
+        if str(row.get("item_code") or "").casefold() in deleted
+    }
+    price_components = [
+        row for row in catalog.price_component_rows
+        if str(row.get("price_rule_key") or "") not in invalid_rule_keys
+    ]
+    valid_rule_keys = {str(row.get("price_rule_key") or "") for row in price_components}
+    price_rules = [
+        row for row in catalog.price_rule_rows
+        if str(row.get("price_rule_key") or "") in valid_rule_keys
+    ]
+    return ReferenceCatalog(
+        items,
+        catalog.channel_rows,
+        mappings,
+        mapping_components,
+        price_rules,
+        price_components,
+    )
 
 
 def write_db_log(message: str) -> None:
@@ -85,6 +149,45 @@ def fetch_all(client, table_name: str) -> list[dict]:
         if len(page) < 1000:
             return rows
         start += 1000
+
+
+def merge_reference_rows(
+    local_rows: list[dict],
+    remote_rows: list[dict],
+    *key_fields: str,
+) -> list[dict]:
+    """내장 DB를 기본으로 두고 같은 키의 Supabase 행이 있으면 원격 값을 우선한다."""
+    merged: dict[tuple[str, ...], dict] = {}
+    for row in [*local_rows, *remote_rows]:
+        key = tuple(str(row.get(field, "")) for field in key_fields)
+        if any(key):
+            merged[key] = row
+    return list(merged.values())
+
+
+def read_local_reference_table(table_name: str) -> list[dict]:
+    path = LOCAL_DATA_DIR / f"{table_name}.csv"
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def load_merged_reference_data(client) -> tuple[list[dict], ...]:
+    specs = (
+        ("ecount_item_reference", ("item_code",)),
+        ("ecount_sales_channels", ("source_name",)),
+        ("ecount_product_mappings", ("mapping_key",)),
+        ("ecount_product_mapping_components", ("mapping_key", "sequence")),
+        ("ecount_price_rules", ("price_rule_key",)),
+        ("ecount_price_rule_components", ("price_rule_key", "sequence")),
+    )
+    return tuple(
+        merge_reference_rows(
+            read_local_reference_table(table_name),
+            fetch_all(client, table_name),
+            *key_fields,
+        )
+        for table_name, key_fields in specs
+    )
 
 
 class SupabaseConnectWorker(QObject):
@@ -120,15 +223,18 @@ class SupabaseConnectWorker(QObject):
                 raise RuntimeError("로그인 세션을 받지 못했습니다.")
             write_db_log("계정 로그인 성공")
             self.status_changed.emit("로그인 완료 · 최신 DB 불러오는 중...")
-            catalog = ReferenceCatalog(
-                fetch_all(client, "ecount_item_reference"),
-                fetch_all(client, "ecount_sales_channels"),
-                fetch_all(client, "ecount_product_mappings"),
-                fetch_all(client, "ecount_product_mapping_components"),
-                fetch_all(client, "ecount_price_rules"),
-                fetch_all(client, "ecount_price_rule_components"),
+            items, channels, mappings, mapping_components, price_rules, price_components = (
+                load_merged_reference_data(client)
             )
-            write_db_log("DB 테이블 조회 및 기준정보 구성 성공")
+            catalog = ReferenceCatalog(
+                items,
+                channels,
+                mappings,
+                mapping_components,
+                price_rules,
+                price_components,
+            )
+            write_db_log("Supabase 원격 DB와 내장 판매전표 DB 통합 성공")
             self.connected.emit(client, catalog)
         except Exception as exc:
             write_db_log(f"연결 실패: {type(exc).__name__}: {exc}")
@@ -158,6 +264,11 @@ class SetMappingDialog(QDialog):
         layout.addWidget(title)
         self.target_label = QLabel(f"세트 1개 기준 배분 대상 금액: {order.unit_total:,.0f}원")
         layout.addWidget(self.target_label)
+        component_guide = QLabel(
+            "행사·공동구매처럼 세트로 분류됐지만 실제 품목이 하나라면 구성품 1개만 남겨 저장할 수 있습니다."
+        )
+        component_guide.setStyleSheet("color:#526D82;")
+        layout.addWidget(component_guide)
 
         self.component_table = QTableWidget(0, 4)
         self.component_table.setHorizontalHeaderLabels(["DB 품목", "세트당 수량", "개당 금액", "배분 금액"])
@@ -191,7 +302,13 @@ class SetMappingDialog(QDialog):
                 self.add_component_row(
                     str(component.get("item_code") or ""),
                     Decimal(str(component.get("quantity") or 1)),
-                    Decimal("0"),
+                    Decimal(
+                        str(
+                            component.get("allocated_unit_price")
+                            or component.get("unit_price")
+                            or 0
+                        )
+                    ),
                 )
         else:
             self.add_component_row()
@@ -302,8 +419,8 @@ class SetMappingDialog(QDialog):
 
     def validate_and_accept(self) -> None:
         components = self.components()
-        if len(components) < 2:
-            QMessageBox.warning(self, "세트 구성 확인", "세트 구성품을 2개 이상 입력해주세요.")
+        if len(components) < 1:
+            QMessageBox.warning(self, "세트 구성 확인", "세트 구성품을 1개 이상 입력해주세요.")
             return
         if any(row["item_code"] not in self.items for row in components):
             QMessageBox.warning(self, "품목 확인", "모든 구성품을 판매전표 DB 품목에서 선택해주세요.")
@@ -326,6 +443,227 @@ class SetMappingDialog(QDialog):
         self.accept()
 
 
+class ItemEditDialog(QDialog):
+    def __init__(self, item_code: str = "", item_name: str = "", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("판매전표 품목 등록" if not item_code else "판매전표 품목 수정")
+        form = QFormLayout(self)
+        self.code_input = QLineEdit(item_code)
+        self.name_input = QLineEdit(item_name)
+        self.code_input.setReadOnly(bool(item_code))
+        form.addRow("품목코드", self.code_input)
+        form.addRow("품목명", self.name_input)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("저장")
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _validate(self) -> None:
+        if not self.code_input.text().strip() or not self.name_input.text().strip():
+            QMessageBox.warning(self, "필수값", "품목코드와 품목명을 모두 입력해주세요.")
+            return
+        self.accept()
+
+    def values(self) -> tuple[str, str]:
+        return self.code_input.text().strip(), self.name_input.text().strip()
+
+
+class RuleIdentityDialog(QDialog):
+    def __init__(
+        self,
+        product_name: str = "",
+        options: str = "",
+        total_unit_price: Decimal = Decimal("0"),
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("상품 매칭·가격 규칙")
+        form = QFormLayout(self)
+        self.product_input = QLineEdit(product_name)
+        self.options_input = QLineEdit(options)
+        self.amount_input = QLineEdit(f"{total_unit_price:,.0f}")
+        self.amount_input.setAlignment(Qt.AlignRight)
+        form.addRow("쇼핑몰 상품명", self.product_input)
+        form.addRow("옵션", self.options_input)
+        form.addRow("세트 1개 총금액", self.amount_input)
+        guide = QLabel("같은 상품명·옵션·총금액 규칙은 중복 저장할 수 없습니다.")
+        guide.setStyleSheet("color:#526D82;")
+        form.addRow(guide)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("구성품·가격 입력")
+        buttons.accepted.connect(self._validate)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def _validate(self) -> None:
+        if not self.product_input.text().strip():
+            QMessageBox.warning(self, "필수값", "쇼핑몰 상품명을 입력해주세요.")
+            return
+        try:
+            amount = Decimal(self.amount_input.text().replace(",", "").strip())
+        except Exception:
+            QMessageBox.warning(self, "금액 확인", "총금액을 숫자로 입력해주세요.")
+            return
+        if amount < 0 or amount != amount.to_integral_value():
+            QMessageBox.warning(self, "금액 확인", "총금액은 0 이상의 원 단위 정수여야 합니다.")
+            return
+        self.accept()
+
+    def values(self) -> tuple[str, str, Decimal]:
+        return (
+            self.product_input.text().strip(),
+            self.options_input.text().strip(),
+            Decimal(self.amount_input.text().replace(",", "").strip()),
+        )
+
+
+class NumericTableWidgetItem(QTableWidgetItem):
+    def __init__(self, value: Decimal | int | float, suffix: str = "") -> None:
+        numeric = Decimal(str(value))
+        super().__init__(f"{numeric:,.0f}{suffix}")
+        self.numeric_value = numeric
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if isinstance(other, NumericTableWidgetItem):
+            return self.numeric_value < other.numeric_value
+        return super().__lt__(other)
+
+
+class ItemChecklistDialog(QDialog):
+    def __init__(
+        self,
+        title: str,
+        items: list[dict],
+        checked_codes: set[str],
+        action_text: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(620, 560)
+        layout = QVBoxLayout(self)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("품목코드 또는 품목명 검색")
+        self.search.setClearButtonEnabled(True)
+        layout.addWidget(self.search)
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["품목코드", "품목명"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.setSortingEnabled(False)
+        for row_data in sorted(items, key=lambda row: str(row.get("item_code") or "").casefold()):
+            code = str(row_data.get("item_code") or "")
+            name = str(row_data.get("representative_name") or row_data.get("item_name") or "")
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            code_item = QTableWidgetItem(code)
+            code_item.setFlags(code_item.flags() | Qt.ItemIsUserCheckable)
+            code_item.setCheckState(Qt.Checked if code in checked_codes else Qt.Unchecked)
+            name_item = QTableWidgetItem(name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 0, code_item)
+            self.table.setItem(row, 1, name_item)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table)
+        self.search.textChanged.connect(self._filter)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText(action_text)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _filter(self, text: str) -> None:
+        keyword = (text or "").strip().casefold()
+        for row in range(self.table.rowCount()):
+            searchable = " ".join(
+                self.table.item(row, column).text()
+                for column in range(2)
+                if self.table.item(row, column) is not None
+            ).casefold()
+            self.table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+    def checked_codes(self) -> set[str]:
+        return {
+            self.table.item(row, 0).text()
+            for row in range(self.table.rowCount())
+            if self.table.item(row, 0).checkState() == Qt.Checked
+        }
+
+
+class SpecialLinesDialog(QDialog):
+    def __init__(self, lines: list[VoucherLine], voucher_date: date, manager_code: str, parent=None) -> None:
+        super().__init__(parent)
+        self.lines = lines
+        self.voucher_date = voucher_date
+        self.manager_code = manager_code
+        self.setWindowTitle("본사출고 품목")
+        self.resize(850, 520)
+        layout = QVBoxLayout(self)
+        total_quantity = sum((line.quantity for line in lines), Decimal("0"))
+        total_amount = sum((line.total for line in lines), Decimal("0"))
+        summary = QLabel(
+            f"품목행 {len(lines):,}개 · 수량 {total_quantity:,.0f}개 · 금액 {total_amount:,.0f}원 "
+            "(전체 전표 총액에는 그대로 포함)"
+        )
+        summary.setStyleSheet("font-weight:700;color:#0F766E;")
+        layout.addWidget(summary)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("품목코드·품목명·창고 검색")
+        self.search.setClearButtonEnabled(True)
+        layout.addWidget(self.search)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["품목코드", "품목명", "수량", "단가", "금액"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for column in range(2, 5):
+            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(lines))
+        for row, line in enumerate(lines):
+            values = [line.item_code, line.item_name, line.quantity, line.unit_price, line.total]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value)) if column < 2 else NumericTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column >= 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(row, column, item)
+        self.table.setSortingEnabled(True)
+        self.search.textChanged.connect(self._filter)
+        layout.addWidget(self.table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        export_button = buttons.addButton("본사출고 Excel 저장", QDialogButtonBox.ActionRole)
+        export_button.clicked.connect(self._export)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _filter(self, text: str) -> None:
+        keyword = (text or "").strip().casefold()
+        for row in range(self.table.rowCount()):
+            searchable = " ".join(
+                self.table.item(row, column).text()
+                for column in range(2)
+                if self.table.item(row, column) is not None
+            ).casefold()
+            self.table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+    def _export(self) -> None:
+        if not self.lines:
+            QMessageBox.information(self, "대상 없음", "저장할 본사출고 품목이 없습니다.")
+            return
+        suggested = f"본사출고_이카운트_판매전표_{self.voucher_date:%Y%m%d}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(self, "본사출고 Excel 저장", suggested, "Excel 파일 (*.xlsx)")
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            write_ecount_lines_workbook(path, self.lines, self.voucher_date, self.manager_code, "본사출고")
+            QMessageBox.information(self, "저장 완료", f"본사출고 품목만 저장했습니다.\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "저장 실패", str(exc))
+
+
 class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -333,6 +671,9 @@ class SalesVoucherWindow(QMainWindow):
         self.setWindowTitle("REQM 판매전표 반자동화 - DB 로그인 수정본")
         self.resize(1280, 760)
         self.catalog: ReferenceCatalog | None = None
+        self.base_catalog: ReferenceCatalog | None = None
+        self.special_item_codes = load_code_set(SPECIAL_ITEMS_PATH)
+        self.deleted_item_codes = load_code_set(DELETED_ITEMS_PATH)
         self.supabase_client = None
         self.db_thread: QThread | None = None
         self.db_worker: SupabaseConnectWorker | None = None
@@ -370,8 +711,17 @@ class SalesVoucherWindow(QMainWindow):
         self.summary_shipping = QLabel("0원")
         self.summary_difference = QLabel("0원")
         self.lines_table = QTableWidget(0, 7)
+        self.pivot_table = QTableWidget(0, 5)
         self.issues_table = QTableWidget(0, 6)
         self.shipping_table = QTableWidget(0, 7)
+        self.db_item_search = QLineEdit()
+        self.db_rule_search = QLineEdit()
+        self.result_filter_column = QComboBox()
+        self.db_item_filter_column = QComboBox()
+        self.db_rule_filter_column = QComboBox()
+        self.table_filter_controls: list[tuple[QTableWidget, QComboBox, QLineEdit]] = []
+        self.db_items_table = QTableWidget(0, 3)
+        self.db_rules_table = QTableWidget(0, 7)
         self.export_button = QPushButton("이카운트 Excel 저장")
         self.export_button.setEnabled(False)
         self._build_ui()
@@ -480,6 +830,11 @@ class SalesVoucherWindow(QMainWindow):
         result_layout.setSpacing(5)
         result_search_layout = QHBoxLayout()
         result_search_layout.addWidget(QLabel("품목 검색"))
+        self.result_filter_column.addItems(["전체 열", "품목코드", "품목명", "수량", "단가", "금액", "창고", "주문건수"])
+        self.result_filter_column.currentIndexChanged.connect(
+            lambda: self.filter_result_lines(self.result_search.text())
+        )
+        result_search_layout.addWidget(self.result_filter_column)
         self.result_search = QLineEdit()
         self.result_search.setPlaceholderText("품목코드 또는 품목명의 일부를 입력하세요")
         self.result_search.setClearButtonEnabled(True)
@@ -492,6 +847,20 @@ class SalesVoucherWindow(QMainWindow):
         result_layout.addWidget(self.lines_table, 1)
         tabs.addTab(result_tab, "자동 변환 결과")
 
+        self.pivot_table.setHorizontalHeaderLabels(["품목코드", "품목명", "합계 수량", "평균 단가", "합계 금액"])
+        self.pivot_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.pivot_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        for column in range(2, 5):
+            self.pivot_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.pivot_table.setAlternatingRowColors(True)
+        self.pivot_table.setSortingEnabled(True)
+        pivot_tab = QWidget()
+        pivot_layout = QVBoxLayout(pivot_tab)
+        pivot_layout.setContentsMargins(5, 5, 5, 5)
+        self._add_column_filter(pivot_layout, self.pivot_table, ["품목코드", "품목명", "합계 수량", "평균 단가", "합계 금액"])
+        pivot_layout.addWidget(self.pivot_table)
+        tabs.addTab(pivot_tab, "품목 집계")
+
         self.issues_table.setColumnCount(7)
         self.issues_table.setHorizontalHeaderLabels(["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"])
         self.issues_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -503,7 +872,16 @@ class SalesVoucherWindow(QMainWindow):
         self.issues_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.issues_table.cellDoubleClicked.connect(self.open_set_mapping_dialog)
         self.issues_table.setToolTip("확인 필요 항목을 더블클릭하면 Supabase 세트 품목과 금액을 연결할 수 있습니다.")
-        tabs.addTab(self.issues_table, "확인 필요")
+        issues_tab = QWidget()
+        issues_layout = QVBoxLayout(issues_tab)
+        issues_layout.setContentsMargins(5, 5, 5, 5)
+        self._add_column_filter(
+            issues_layout,
+            self.issues_table,
+            ["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"],
+        )
+        issues_layout.addWidget(self.issues_table)
+        tabs.addTab(issues_tab, "확인 필요")
 
         self.shipping_table.setHorizontalHeaderLabels(
             ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액(참고)", "전표 배송비", "구분"]
@@ -513,7 +891,101 @@ class SalesVoucherWindow(QMainWindow):
         for column in range(2, 7):
             self.shipping_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.shipping_table.setAlternatingRowColors(True)
-        tabs.addTab(self.shipping_table, "배송비 검수")
+        shipping_tab = QWidget()
+        shipping_layout = QVBoxLayout(shipping_tab)
+        shipping_layout.setContentsMargins(5, 5, 5, 5)
+        self._add_column_filter(
+            shipping_layout,
+            self.shipping_table,
+            ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액", "전표 배송비", "구분"],
+        )
+        shipping_layout.addWidget(self.shipping_table)
+        tabs.addTab(shipping_tab, "배송비 검수")
+
+        db_tab = QWidget()
+        db_layout = QVBoxLayout(db_tab)
+        db_layout.setContentsMargins(5, 5, 5, 5)
+        db_guide = QLabel(
+            "DB 데이터는 누구나 조회할 수 있으며, 등록·수정은 Supabase 관리자 로그인 후 가능합니다."
+        )
+        db_guide.setStyleSheet("color:#526D82;")
+        db_layout.addWidget(db_guide)
+        db_subtabs = QTabWidget()
+
+        item_tab = QWidget()
+        item_layout = QVBoxLayout(item_tab)
+        item_controls = QHBoxLayout()
+        self.db_item_search.setPlaceholderText("품목코드 또는 품목명 검색")
+        self.db_item_search.setClearButtonEnabled(True)
+        self.db_item_search.textChanged.connect(self.filter_db_items)
+        self.db_item_filter_column.addItems(["전체 열", "품목코드", "품목명", "상태"])
+        self.db_item_filter_column.currentIndexChanged.connect(
+            lambda: self.filter_db_items(self.db_item_search.text())
+        )
+        item_controls.addWidget(self.db_item_filter_column)
+        item_controls.addWidget(self.db_item_search, 1)
+        add_item_button = QPushButton("품목 등록")
+        edit_item_button = QPushButton("선택 품목 수정")
+        delete_item_button = QPushButton("선택 품목 로컬 삭제")
+        deleted_items_button = QPushButton("삭제 품목·복구")
+        add_item_button.clicked.connect(self.add_db_item)
+        edit_item_button.clicked.connect(self.edit_db_item)
+        delete_item_button.clicked.connect(self.delete_local_db_items)
+        deleted_items_button.clicked.connect(self.open_deleted_items)
+        item_controls.addWidget(add_item_button)
+        item_controls.addWidget(edit_item_button)
+        item_controls.addWidget(delete_item_button)
+        item_controls.addWidget(deleted_items_button)
+        item_layout.addLayout(item_controls)
+        self.db_items_table.setHorizontalHeaderLabels(["품목코드", "품목명", "상태"])
+        self.db_items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.db_items_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.db_items_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.db_items_table.setSortingEnabled(True)
+        self.db_items_table.setAlternatingRowColors(True)
+        self.db_items_table.doubleClicked.connect(self.edit_db_item)
+        item_layout.addWidget(self.db_items_table)
+        db_subtabs.addTab(item_tab, "품목")
+
+        rule_tab = QWidget()
+        rule_layout = QVBoxLayout(rule_tab)
+        rule_controls = QHBoxLayout()
+        self.db_rule_search.setPlaceholderText("상품명·옵션·품목코드·품목명 검색")
+        self.db_rule_search.setClearButtonEnabled(True)
+        self.db_rule_search.textChanged.connect(self.filter_db_rules)
+        self.db_rule_filter_column.addItems(
+            ["전체 열", "상품명", "옵션", "총금액", "구분", "구성품·배분금액", "상태"]
+        )
+        self.db_rule_filter_column.currentIndexChanged.connect(
+            lambda: self.filter_db_rules(self.db_rule_search.text())
+        )
+        rule_controls.addWidget(self.db_rule_filter_column)
+        rule_controls.addWidget(self.db_rule_search, 1)
+        add_rule_button = QPushButton("매칭·가격 등록")
+        edit_rule_button = QPushButton("선택 규칙 수정")
+        add_rule_button.clicked.connect(self.add_db_rule)
+        edit_rule_button.clicked.connect(self.edit_db_rule)
+        rule_controls.addWidget(add_rule_button)
+        rule_controls.addWidget(edit_rule_button)
+        rule_layout.addLayout(rule_controls)
+        self.db_rules_table.setHorizontalHeaderLabels(
+            ["상품명", "옵션", "총금액", "구분", "구성품·배분금액", "상태", "규칙키"]
+        )
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        self.db_rules_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        self.db_rules_table.setColumnHidden(6, True)
+        self.db_rules_table.setSortingEnabled(True)
+        self.db_rules_table.setAlternatingRowColors(True)
+        self.db_rules_table.doubleClicked.connect(self.edit_db_rule)
+        rule_layout.addWidget(self.db_rules_table)
+        db_subtabs.addTab(rule_tab, "상품 매칭·가격")
+
+        db_layout.addWidget(db_subtabs)
+        tabs.addTab(db_tab, "DB 관리")
         layout.addWidget(tabs, 1)
 
         bottom = QHBoxLayout()
@@ -525,6 +997,12 @@ class SalesVoucherWindow(QMainWindow):
         add_db_button = QPushButton("DB에 단품 바로 추가")
         add_db_button.clicked.connect(self.add_selected_issue_to_db)
         bottom.addWidget(add_db_button)
+        special_select_button = QPushButton("본사출고 품목 지정")
+        special_view_button = QPushButton("본사출고 보기·저장")
+        special_select_button.clicked.connect(self.select_special_items)
+        special_view_button.clicked.connect(self.open_special_items)
+        bottom.addWidget(special_select_button)
+        bottom.addWidget(special_view_button)
         bottom.addStretch()
         self.export_button.clicked.connect(self.export_excel)
         bottom.addWidget(self.export_button)
@@ -559,11 +1037,56 @@ class SalesVoucherWindow(QMainWindow):
             """
         )
 
+    def _add_column_filter(
+        self,
+        layout: QVBoxLayout,
+        table: QTableWidget,
+        headers: list[str],
+    ) -> None:
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("열 필터"))
+        column = QComboBox()
+        column.addItem("전체 열")
+        column.addItems(headers)
+        keyword = QLineEdit()
+        keyword.setPlaceholderText("선택한 열에서 찾을 값을 입력하세요")
+        keyword.setClearButtonEnabled(True)
+        controls.addWidget(column)
+        controls.addWidget(keyword, 1)
+        keyword.textChanged.connect(lambda: self._filter_table(table, column, keyword))
+        column.currentIndexChanged.connect(lambda: self._filter_table(table, column, keyword))
+        layout.addLayout(controls)
+        self.table_filter_controls.append((table, column, keyword))
+
+    def _filter_table(
+        self,
+        table: QTableWidget,
+        column_selector: QComboBox,
+        keyword_input: QLineEdit,
+    ) -> None:
+        keyword = keyword_input.text().strip().casefold()
+        selected = column_selector.currentIndex() - 1
+        for row in range(table.rowCount()):
+            columns = range(table.columnCount()) if selected < 0 else (selected,)
+            searchable = " ".join(
+                table.item(row, column).text()
+                for column in columns
+                if table.item(row, column) is not None
+            ).casefold()
+            table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+    def _reapply_table_filters(self, table: QTableWidget) -> None:
+        for target, column, keyword in self.table_filter_controls:
+            if target is table:
+                self._filter_table(target, column, keyword)
+
     def _load_local_catalog(self) -> None:
         try:
-            self.catalog = ReferenceCatalog.from_csv_dir(LOCAL_DATA_DIR)
+            self.base_catalog = ReferenceCatalog.from_csv_dir(LOCAL_DATA_DIR)
+            self.catalog = catalog_without_items(self.base_catalog, self.deleted_item_codes)
             self.db_status.setText("로컬 기준 DB 사용 중 (Supabase 연결 가능)")
             self.db_status.setStyleSheet("color:#047857;")
+            self._refresh_db_management()
         except Exception as exc:
             self.db_status.setText(f"DB 준비 실패: {exc}")
             self.db_status.setStyleSheet("color:#B91C1C;")
@@ -630,9 +1153,11 @@ class SalesVoucherWindow(QMainWindow):
 
     def _on_db_connected(self, client: object, catalog: object) -> None:
         self.supabase_client = client
-        self.catalog = catalog
+        self.base_catalog = catalog
+        self.catalog = catalog_without_items(catalog, self.deleted_item_codes)
+        self._refresh_db_management()
         write_db_log("프로그램에 Supabase DB 연결 적용 완료")
-        self.db_status.setText("Supabase 최신 DB 연결 완료")
+        self.db_status.setText("Supabase + 내장 최신 DB 연결 완료")
         self.db_status.setStyleSheet("color:#047857;font-weight:600;")
 
     def _on_db_failed(self, message: str) -> None:
@@ -706,6 +1231,7 @@ class SalesVoucherWindow(QMainWindow):
                 confirmed_orders = read_purchase_confirmed_orders(confirmed_source)
             orders = combine_order_sources(original_orders, confirmed_orders)
             self.current_result = convert_orders(orders, self.catalog, default_warehouse=str(self.default_warehouse.value()))
+            self._apply_special_warehouses()
             self._show_result(self.current_result)
             self.export_button.setEnabled(bool(self.current_result.lines))
         except Exception as exc:
@@ -754,6 +1280,7 @@ class SalesVoucherWindow(QMainWindow):
                 self.lines_table.setItem(row_index, column, item)
         self.lines_table.setSortingEnabled(False)
         self.filter_result_lines(self.result_search.text())
+        self._show_pivot_result(result)
 
         self.issues_table.setRowCount(len(result.issues))
         for row_index, issue in enumerate(result.issues):
@@ -792,18 +1319,19 @@ class SalesVoucherWindow(QMainWindow):
                 if charge.is_adjusted:
                     item.setBackground(QColor("#FED7AA"))
                 self.shipping_table.setItem(row_index, column, item)
+        self._reapply_table_filters(self.issues_table)
+        self._reapply_table_filters(self.shipping_table)
 
     def filter_result_lines(self, text: str) -> None:
         keyword = (text or "").strip().casefold()
+        selected = self.result_filter_column.currentIndex() - 1
         visible = 0
         for row in range(self.lines_table.rowCount()):
-            item_code = self.lines_table.item(row, 0)
-            item_name = self.lines_table.item(row, 1)
+            columns = range(self.lines_table.columnCount()) if selected < 0 else (selected,)
             searchable = " ".join(
-                (
-                    item_code.text() if item_code is not None else "",
-                    item_name.text() if item_name is not None else "",
-                )
+                self.lines_table.item(row, column).text()
+                for column in columns
+                if self.lines_table.item(row, column) is not None
             ).casefold()
             show = not keyword or keyword in searchable
             self.lines_table.setRowHidden(row, not show)
@@ -813,6 +1341,521 @@ class SalesVoucherWindow(QMainWindow):
             self.result_filter_count.setText(f"{visible:,}/{self.lines_table.rowCount():,}행")
         else:
             self.result_filter_count.setText(f"전체 {self.lines_table.rowCount():,}행")
+
+    def _show_pivot_result(self, result: ConversionResult) -> None:
+        grouped: dict[tuple[str, str], dict[str, Decimal]] = {}
+        for line in result.lines:
+            key = (line.item_code, line.item_name)
+            values = grouped.setdefault(key, {"quantity": Decimal("0"), "amount": Decimal("0")})
+            values["quantity"] += line.quantity
+            values["amount"] += line.total
+        self.pivot_table.setSortingEnabled(False)
+        self.pivot_table.setRowCount(len(grouped))
+        for row, ((item_code, item_name), values) in enumerate(sorted(grouped.items())):
+            quantity = values["quantity"]
+            amount = values["amount"]
+            average = amount / quantity if quantity else Decimal("0")
+            texts = [
+                item_code,
+                item_name,
+                f"{quantity:,.0f}",
+                f"{average:,.0f}",
+                f"{amount:,.0f}",
+            ]
+            for column, text in enumerate(texts):
+                item = (
+                    NumericTableWidgetItem([quantity, average, amount][column - 2])
+                    if column >= 2
+                    else QTableWidgetItem(text)
+                )
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column >= 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.pivot_table.setItem(row, column, item)
+        self.pivot_table.setSortingEnabled(True)
+        self._reapply_table_filters(self.pivot_table)
+
+    def _refresh_db_management(self) -> None:
+        if self.catalog is None:
+            return
+        item_rows = sorted(
+            self.catalog.item_rows,
+            key=lambda row: str(row.get("item_code") or "").casefold(),
+        )
+        self.db_items_table.setSortingEnabled(False)
+        self.db_items_table.setRowCount(len(item_rows))
+        for row_index, row in enumerate(item_rows):
+            values = [
+                str(row.get("item_code") or ""),
+                str(
+                    row.get("representative_name")
+                    or row.get("item_name")
+                    or row.get("standard_name")
+                    or ""
+                ),
+                str(row.get("review_status") or "confirmed"),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.db_items_table.setItem(row_index, column, item)
+        self.db_items_table.setSortingEnabled(True)
+
+        price_components: dict[str, list[dict]] = {}
+        for component in self.catalog.price_component_rows:
+            price_components.setdefault(str(component.get("price_rule_key") or ""), []).append(component)
+        rule_rows = sorted(
+            self.catalog.price_rule_rows,
+            key=lambda row: (
+                str(row.get("source_product_name") or "").casefold(),
+                Decimal(str(row.get("total_unit_price") or 0)),
+            ),
+        )
+        self.db_rules_table.setSortingEnabled(False)
+        self.db_rules_table.setRowCount(len(rule_rows))
+        for row_index, row in enumerate(rule_rows):
+            rule_key = str(row.get("price_rule_key") or "")
+            components = sorted(
+                price_components.get(rule_key, []),
+                key=lambda component: int(component.get("sequence") or 0),
+            )
+            component_text = " / ".join(
+                f"{component.get('item_code', '')} × {Decimal(str(component.get('quantity') or 1)):g}"
+                f" @ {Decimal(str(component.get('allocated_unit_price') or 0)):,.0f}원"
+                for component in components
+            )
+            values = [
+                str(row.get("source_product_name") or ""),
+                str(row.get("source_options") or ""),
+                f"{Decimal(str(row.get('total_unit_price') or 0)):,.0f}",
+                str(row.get("item_type") or ""),
+                component_text,
+                str(row.get("review_status") or "confirmed"),
+                rule_key,
+            ]
+            for column, value in enumerate(values):
+                item = (
+                    NumericTableWidgetItem(Decimal(str(row.get("total_unit_price") or 0)))
+                    if column == 2
+                    else QTableWidgetItem(value)
+                )
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column == 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.db_rules_table.setItem(row_index, column, item)
+        self.db_rules_table.setSortingEnabled(True)
+
+        self.filter_db_items(self.db_item_search.text())
+        self.filter_db_rules(self.db_rule_search.text())
+
+    def filter_db_items(self, text: str) -> None:
+        keyword = (text or "").strip().casefold()
+        selected = self.db_item_filter_column.currentIndex() - 1
+        for row in range(self.db_items_table.rowCount()):
+            columns = range(self.db_items_table.columnCount()) if selected < 0 else (selected,)
+            searchable = " ".join(
+                self.db_items_table.item(row, column).text()
+                for column in columns
+                if self.db_items_table.item(row, column) is not None
+            ).casefold()
+            self.db_items_table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+    def filter_db_rules(self, text: str) -> None:
+        keyword = (text or "").strip().casefold()
+        selected = self.db_rule_filter_column.currentIndex() - 1
+        for row in range(self.db_rules_table.rowCount()):
+            columns = range(self.db_rules_table.columnCount()) if selected < 0 else (selected,)
+            searchable = " ".join(
+                self.db_rules_table.item(row, column).text()
+                for column in columns
+                if self.db_rules_table.item(row, column) is not None
+            ).casefold()
+            self.db_rules_table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+    def _require_supabase(self) -> bool:
+        if self.supabase_client is not None:
+            return True
+        QMessageBox.information(
+            self,
+            "DB 로그인 필요",
+            "조회는 내장 DB로 가능하지만 등록·수정은 Supabase 관리자 로그인 후 가능합니다.",
+        )
+        return False
+
+    def _apply_special_warehouses(self) -> None:
+        if self.current_result is None:
+            return
+        for line in self.current_result.lines:
+            is_qm4100 = "QM4100" in f"{line.item_code} {line.item_name}".upper()
+            line.warehouse = (
+                "100"
+                if line.item_code in self.special_item_codes or is_qm4100
+                else str(self.default_warehouse.value())
+            )
+
+    def select_special_items(self) -> None:
+        source_catalog = self.base_catalog or self.catalog
+        if source_catalog is None:
+            return
+        available_rows = [
+            row for row in source_catalog.item_rows
+            if str(row.get("item_code") or "") not in self.deleted_item_codes
+        ]
+        dialog = ItemChecklistDialog(
+            "본사출고 특수 품목 지정",
+            available_rows,
+            self.special_item_codes,
+            "본사출고 품목 적용",
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self.special_item_codes = dialog.checked_codes()
+        try:
+            save_code_set(SPECIAL_ITEMS_PATH, self.special_item_codes)
+        except Exception as exc:
+            QMessageBox.critical(self, "설정 저장 실패", str(exc))
+            return
+        self._apply_special_warehouses()
+        if self.current_result is not None:
+            self._show_result(self.current_result)
+        QMessageBox.information(
+            self,
+            "본사출고 품목 적용",
+            f"{len(self.special_item_codes):,}개 품목을 본사창고(100) 출고 대상으로 지정했습니다.",
+        )
+
+    def open_special_items(self) -> None:
+        if self.current_result is None:
+            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            return
+        lines = [
+            line for line in self.current_result.lines
+            if line.item_code in self.special_item_codes
+        ]
+        dialog = SpecialLinesDialog(
+            lines,
+            self.voucher_date.date().toPython(),
+            self.manager_code.text().strip() or "00109",
+            self,
+        )
+        dialog.exec()
+
+    def delete_local_db_items(self) -> None:
+        source_catalog = self.base_catalog or self.catalog
+        if source_catalog is None:
+            return
+        selected_rows = sorted({index.row() for index in self.db_items_table.selectedIndexes()})
+        if not selected_rows and self.db_items_table.currentRow() >= 0:
+            selected_rows = [self.db_items_table.currentRow()]
+        codes = {
+            self.db_items_table.item(row, 0).text()
+            for row in selected_rows
+            if self.db_items_table.item(row, 0) is not None
+        }
+        if not codes:
+            QMessageBox.information(self, "선택 필요", "로컬 DB에서 숨길 품목을 선택해주세요.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "로컬 품목 삭제",
+            f"{len(codes):,}개 품목을 이 프로그램의 DB에서 삭제할까요?\n"
+            "Supabase 원본 데이터는 삭제되지 않으며 언제든 복구할 수 있습니다.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.deleted_item_codes.update(codes)
+        save_code_set(DELETED_ITEMS_PATH, self.deleted_item_codes)
+        self.special_item_codes.difference_update(codes)
+        save_code_set(SPECIAL_ITEMS_PATH, self.special_item_codes)
+        self.catalog = catalog_without_items(source_catalog, self.deleted_item_codes)
+        self._refresh_db_management()
+        self.db_status.setText(f"로컬 DB 품목 {len(codes):,}개 삭제 · Supabase 유지")
+        self.db_status.setStyleSheet("color:#B45309;font-weight:600;")
+
+    def open_deleted_items(self) -> None:
+        source_catalog = self.base_catalog or self.catalog
+        if source_catalog is None:
+            return
+        deleted_rows = [
+            row for row in source_catalog.item_rows
+            if str(row.get("item_code") or "") in self.deleted_item_codes
+        ]
+        dialog = ItemChecklistDialog(
+            "삭제 DB 관리 - 삭제 품목",
+            deleted_rows,
+            set(),
+            "선택 품목 복구",
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        restored = dialog.checked_codes()
+        if not restored:
+            QMessageBox.information(self, "복구 선택", "복구할 품목의 체크박스를 선택해주세요.")
+            return
+        self.deleted_item_codes.difference_update(restored)
+        save_code_set(DELETED_ITEMS_PATH, self.deleted_item_codes)
+        self.catalog = catalog_without_items(source_catalog, self.deleted_item_codes)
+        self._refresh_db_management()
+        self.db_status.setText(f"로컬 DB 품목 {len(restored):,}개 복구 완료")
+        self.db_status.setStyleSheet("color:#047857;font-weight:600;")
+
+    def add_db_item(self) -> None:
+        if not self._require_supabase() or self.catalog is None:
+            return
+        dialog = ItemEditDialog(parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        code, name = dialog.values()
+        if code.casefold() in {str(key).casefold() for key in self.catalog.items}:
+            QMessageBox.warning(self, "중복 품목", f"품목코드 {code}는 이미 등록되어 있습니다.")
+            return
+        normalized_name = normalize_source(name)
+        duplicates = [
+            row for row in self.catalog.item_rows
+            if normalize_source(str(row.get("representative_name") or row.get("item_name") or "")) == normalized_name
+        ]
+        if duplicates:
+            QMessageBox.warning(
+                self,
+                "중복 품목명",
+                f"같은 품목명이 이미 {duplicates[0].get('item_code', '')} 품목으로 등록되어 있습니다.",
+            )
+            return
+        self._upsert_db_item(code, name)
+
+    def edit_db_item(self, *_args) -> None:
+        if not self._require_supabase() or self.catalog is None:
+            return
+        row = self.db_items_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "선택 필요", "수정할 품목을 선택해주세요.")
+            return
+        code = self.db_items_table.item(row, 0).text()
+        name = self.db_items_table.item(row, 1).text()
+        dialog = ItemEditDialog(code, name, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        _, new_name = dialog.values()
+        normalized_name = normalize_source(new_name)
+        duplicate = next(
+            (
+                item for item in self.catalog.item_rows
+                if str(item.get("item_code") or "") != code
+                and normalize_source(str(item.get("representative_name") or item.get("item_name") or "")) == normalized_name
+            ),
+            None,
+        )
+        if duplicate:
+            QMessageBox.warning(
+                self, "중복 품목명",
+                f"같은 품목명이 이미 {duplicate.get('item_code', '')} 품목으로 등록되어 있습니다.",
+            )
+            return
+        self._upsert_db_item(code, new_name)
+
+    def _upsert_db_item(self, code: str, name: str) -> None:
+        try:
+            self.supabase_client.table("ecount_item_reference").upsert(
+                {
+                    "item_code": code,
+                    "representative_name": name,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                },
+                on_conflict="item_code",
+            ).execute()
+            self._reload_supabase_catalog()
+            self.db_status.setText(f"품목 저장 완료: {code}")
+        except Exception as exc:
+            QMessageBox.critical(self, "품목 저장 실패", str(exc))
+
+    def _rule_duplicate(
+        self, product_name: str, options: str, amount: Decimal, exclude_key: str = ""
+    ) -> dict | None:
+        if self.catalog is None:
+            return None
+        normalized = normalize_source(f"{product_name}{options}")
+        return next(
+            (
+                row for row in self.catalog.price_rule_rows
+                if str(row.get("price_rule_key") or "") != exclude_key
+                and str(row.get("source_channel") or "") == "리큐엠_스마트스토어"
+                and str(row.get("normalized_source") or "") == normalized
+                and Decimal(str(row.get("total_unit_price") or 0)) == amount
+            ),
+            None,
+        )
+
+    def add_db_rule(self) -> None:
+        if not self._require_supabase() or self.catalog is None:
+            return
+        identity = RuleIdentityDialog(parent=self)
+        if identity.exec() != QDialog.Accepted:
+            return
+        product, options, amount = identity.values()
+        if self._rule_duplicate(product, options, amount):
+            QMessageBox.warning(self, "중복 규칙", "같은 상품명·옵션·총금액 규칙이 이미 등록되어 있습니다.")
+            return
+        self._edit_rule_components(product, options, amount)
+
+    def edit_db_rule(self, *_args) -> None:
+        if not self._require_supabase() or self.catalog is None:
+            return
+        row_index = self.db_rules_table.currentRow()
+        if row_index < 0:
+            QMessageBox.information(self, "선택 필요", "수정할 매칭·가격 규칙을 선택해주세요.")
+            return
+        rule_key = self.db_rules_table.item(row_index, 6).text()
+        rule = next(
+            (row for row in self.catalog.price_rule_rows if str(row.get("price_rule_key") or "") == rule_key),
+            None,
+        )
+        if rule is None:
+            QMessageBox.warning(self, "규칙 확인", "선택한 규칙을 찾을 수 없습니다.")
+            return
+        identity = RuleIdentityDialog(
+            str(rule.get("source_product_name") or ""),
+            str(rule.get("source_options") or ""),
+            Decimal(str(rule.get("total_unit_price") or 0)),
+            self,
+        )
+        if identity.exec() != QDialog.Accepted:
+            return
+        product, options, amount = identity.values()
+        if self._rule_duplicate(product, options, amount, rule_key):
+            QMessageBox.warning(self, "중복 규칙", "같은 상품명·옵션·총금액 규칙이 이미 등록되어 있습니다.")
+            return
+        existing = [
+            component for component in self.catalog.price_component_rows
+            if str(component.get("price_rule_key") or "") == rule_key
+        ]
+        self._edit_rule_components(product, options, amount, rule_key, existing)
+
+    def _edit_rule_components(
+        self,
+        product: str,
+        options: str,
+        amount: Decimal,
+        price_rule_key: str = "",
+        existing_components: list[dict] | None = None,
+    ) -> None:
+        normalized = normalize_source(f"{product}{options}")
+        order = SmartStoreOrder(
+            source_row=0,
+            order_no="DB-MANUAL",
+            product_order_no="DB-MANUAL",
+            paid_at=datetime.now(),
+            status="DB관리",
+            product_name=product,
+            options=options,
+            quantity=Decimal("1"),
+            item_total=amount,
+        )
+        dialog = SetMappingDialog(order, self.catalog.items, existing_components, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        components = dialog.components()
+        mapping = next(
+            (
+                row for row in self.catalog.mapping_rows
+                if str(row.get("source_channel") or "") == "리큐엠_스마트스토어"
+                and str(row.get("normalized_source") or "") == normalized
+            ),
+            None,
+        )
+        mapping_key = (
+            str(mapping.get("mapping_key") or "") if mapping
+            else hashlib.sha256(f"manual|리큐엠_스마트스토어|{normalized}".encode("utf-8")).hexdigest()
+        )
+        rule_key = price_rule_key or hashlib.sha256(
+            f"manual|리큐엠_스마트스토어|{normalized}|{amount}".encode("utf-8")
+        ).hexdigest()
+        try:
+            self.supabase_client.table("ecount_product_mappings").upsert(
+                {
+                    "mapping_key": mapping_key,
+                    "source_channel": "리큐엠_스마트스토어",
+                    "source_product_text": f"{product}{options}",
+                    "normalized_source": normalized,
+                    "mapping_type": "set",
+                    "component_count": len(components),
+                    "source_row": 0,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                },
+                on_conflict="mapping_key",
+            ).execute()
+            self.supabase_client.table("ecount_product_mapping_components").delete().eq(
+                "mapping_key", mapping_key
+            ).execute()
+            self.supabase_client.table("ecount_product_mapping_components").insert(
+                [
+                    {
+                        "mapping_key": mapping_key,
+                        "sequence": sequence,
+                        "item_code": component["item_code"],
+                        "quantity": float(component["quantity"]),
+                        "source_row": 0,
+                    }
+                    for sequence, component in enumerate(components, 1)
+                ]
+            ).execute()
+            self.supabase_client.table("ecount_price_rules").upsert(
+                {
+                    "price_rule_key": rule_key,
+                    "source_channel": "리큐엠_스마트스토어",
+                    "source_product_name": product,
+                    "source_options": options,
+                    "normalized_source": normalized,
+                    "total_unit_price": float(amount),
+                    "item_type": "세트",
+                    "main_product": components[0]["item_code"],
+                    "set_name": options or product,
+                    "component_count": len(components),
+                    "allocated_total": float(amount),
+                    "allocation_variance": 0,
+                    "source_row": 0,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                },
+                on_conflict="price_rule_key",
+            ).execute()
+            self.supabase_client.table("ecount_price_rule_components").delete().eq(
+                "price_rule_key", rule_key
+            ).execute()
+            self.supabase_client.table("ecount_price_rule_components").insert(
+                [
+                    {
+                        "price_rule_key": rule_key,
+                        "sequence": sequence,
+                        "component_alias": str(
+                            self.catalog.items[component["item_code"]].get("representative_name")
+                            or component["item_code"]
+                        ),
+                        "normalized_component_alias": normalize_source(
+                            str(
+                                self.catalog.items[component["item_code"]].get("representative_name")
+                                or component["item_code"]
+                            )
+                        ),
+                        "item_code": component["item_code"],
+                        "quantity": float(component["quantity"]),
+                        "allocated_unit_price": float(component["unit_price"]),
+                        "source_row": 0,
+                        "review_status": "confirmed",
+                    }
+                    for sequence, component in enumerate(components, 1)
+                ]
+            ).execute()
+            self._reload_supabase_catalog()
+            self.db_status.setText("상품 매칭·가격 규칙 저장 완료")
+            self.db_status.setStyleSheet("color:#047857;font-weight:600;")
+        except Exception as exc:
+            QMessageBox.critical(self, "규칙 저장 실패", str(exc))
 
     def _apply_table_edits(self) -> None:
         assert self.current_result is not None
@@ -1023,14 +2066,9 @@ class SalesVoucherWindow(QMainWindow):
     def _reload_supabase_catalog(self) -> None:
         if self.supabase_client is None:
             return
-        self.catalog = ReferenceCatalog(
-            fetch_all(self.supabase_client, "ecount_item_reference"),
-            fetch_all(self.supabase_client, "ecount_sales_channels"),
-            fetch_all(self.supabase_client, "ecount_product_mappings"),
-            fetch_all(self.supabase_client, "ecount_product_mapping_components"),
-            fetch_all(self.supabase_client, "ecount_price_rules"),
-            fetch_all(self.supabase_client, "ecount_price_rule_components"),
-        )
+        self.base_catalog = ReferenceCatalog(*load_merged_reference_data(self.supabase_client))
+        self.catalog = catalog_without_items(self.base_catalog, self.deleted_item_codes)
+        self._refresh_db_management()
 
     def add_selected_issue_to_db(self) -> None:
         if self.current_result is None or self.catalog is None:

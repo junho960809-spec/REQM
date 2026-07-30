@@ -118,11 +118,11 @@ class SalesCoreTests(unittest.TestCase):
             result = convert_orders(orders, self.catalog)
             shipping_lines = [line for line in result.lines if line.is_shipping]
             self.assertEqual(len(result.shipping_charges), 1)
-            self.assertEqual(result.shipping_charges[0].effective_amount, Decimal("9000.00"))
+            self.assertEqual(result.shipping_charges[0].effective_amount, Decimal("6000.00"))
             self.assertTrue(result.shipping_charges[0].is_adjusted)
             self.assertEqual(len(shipping_lines), 1)
             self.assertEqual(shipping_lines[0].quantity, Decimal("1"))
-            self.assertEqual(shipping_lines[0].unit_price, Decimal("9000.00"))
+            self.assertEqual(shipping_lines[0].unit_price, Decimal("6000.00"))
             self.assertTrue(result.is_reconciled)
 
     def test_review_issue_is_included_and_highlighted_in_export(self) -> None:
@@ -184,6 +184,78 @@ class SalesCoreTests(unittest.TestCase):
             [(Decimal("3"), Decimal("36828.00")), (Decimal("4"), Decimal("36829.00"))],
         )
         self.assertEqual(result.output_total, Decimal("257800.00"))
+        self.assertTrue(result.is_reconciled)
+
+    def test_one_component_set_is_converted_with_single_entered_price(self) -> None:
+        catalog = ReferenceCatalog(
+            items=[{"item_code": "EVENT-ITEM", "representative_name": "행사상품"}],
+            channels=[
+                {
+                    "source_name": "리큐엠_스마트스토어",
+                    "ecount_customer_code": "AC008712",
+                    "ecount_customer_name": "샵N",
+                    "is_active": True,
+                }
+            ],
+            mappings=[
+                {
+                    "mapping_key": "event-set-1",
+                    "source_channel": "리큐엠_스마트스토어",
+                    "normalized_source": "공동구매행사상품옵션",
+                    "mapping_type": "set",
+                    "review_status": "confirmed",
+                    "is_active": True,
+                }
+            ],
+            mapping_components=[
+                {
+                    "mapping_key": "event-set-1",
+                    "sequence": 1,
+                    "item_code": "EVENT-ITEM",
+                    "quantity": 1,
+                }
+            ],
+            price_rules=[
+                {
+                    "price_rule_key": "event-price-1",
+                    "source_channel": "리큐엠_스마트스토어",
+                    "source_product_name": "공동구매 행사상품",
+                    "source_options": "옵션",
+                    "normalized_source": "공동구매행사상품옵션",
+                    "total_unit_price": 27800,
+                    "review_status": "confirmed",
+                    "is_active": True,
+                }
+            ],
+            price_components=[
+                {
+                    "price_rule_key": "event-price-1",
+                    "sequence": 1,
+                    "item_code": "EVENT-ITEM",
+                    "quantity": 1,
+                    "allocated_unit_price": 27800,
+                }
+            ],
+        )
+        order = SmartStoreOrder(
+            source_row=2,
+            order_no="EVENT-O1",
+            product_order_no="EVENT-P1",
+            paid_at=datetime(2026, 7, 30, 10, 0),
+            status="구매확정",
+            product_name="공동구매 행사상품",
+            options="옵션",
+            quantity=Decimal("2"),
+            item_total=Decimal("55600"),
+        )
+
+        result = convert_orders([order], catalog)
+
+        self.assertEqual(result.issues, [])
+        self.assertEqual(len(result.lines), 1)
+        self.assertEqual(result.lines[0].item_code, "EVENT-ITEM")
+        self.assertEqual(result.lines[0].quantity, Decimal("2"))
+        self.assertEqual(result.lines[0].unit_price, Decimal("27800.00"))
         self.assertTrue(result.is_reconciled)
 
     def test_order_period_is_detected_and_all_dates_are_loaded(self) -> None:

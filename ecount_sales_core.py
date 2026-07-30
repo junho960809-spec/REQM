@@ -223,17 +223,27 @@ class ReferenceCatalog:
         price_rules: Iterable[dict[str, Any]],
         price_components: Iterable[dict[str, Any]],
     ) -> None:
-        self.items = {str(row.get("item_code", "")): row for row in items if row.get("item_code")}
+        self.item_rows = list(items)
+        self.channel_rows = list(channels)
+        self.mapping_rows = list(mappings)
+        self.mapping_component_rows = list(mapping_components)
+        self.price_rule_rows = list(price_rules)
+        self.price_component_rows = list(price_components)
+        self.items = {
+            str(row.get("item_code", "")): row
+            for row in self.item_rows
+            if row.get("item_code")
+        }
         self.channels = {
             str(row.get("source_name", "")): row
-            for row in channels
+            for row in self.channel_rows
             if row.get("source_name") and as_bool(row.get("is_active", True))
         }
         components_by_mapping: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in mapping_components:
+        for row in self.mapping_component_rows:
             components_by_mapping[str(row.get("mapping_key", ""))].append(row)
         self.mappings: dict[tuple[str, str], dict[str, Any]] = {}
-        for row in mappings:
+        for row in self.mapping_rows:
             if not as_bool(row.get("is_active", True)) or row.get("review_status") != "confirmed":
                 continue
             entry = dict(row)
@@ -244,10 +254,10 @@ class ReferenceCatalog:
             self.mappings[(str(row.get("source_channel", "")), str(row.get("normalized_source", "")))] = entry
 
         components_by_rule: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for row in price_components:
+        for row in self.price_component_rows:
             components_by_rule[str(row.get("price_rule_key", ""))].append(row)
         self.price_templates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-        for row in price_rules:
+        for row in self.price_rule_rows:
             if not as_bool(row.get("is_active", True)):
                 continue
             if row.get("review_status") not in {"confirmed", "amount_mismatch"}:
@@ -562,8 +572,8 @@ def convert_orders(
             continue
         template = min(templates, key=lambda row: abs(row["total_unit_price"] - order.unit_total))
         price_components = template["components"]
-        if len(price_components) < 2:
-            reason = "세트 가격 배분 구성품이 부족합니다."
+        if len(price_components) < 1:
+            reason = "세트 가격 배분 구성품이 없습니다."
             issues.append(_issue(order, reason))
             _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
@@ -667,9 +677,11 @@ def _collect_shipping_charges(
             issues.append(_issue(first, "같은 배송비 묶음번호에 서로 다른 배송비가 있습니다."))
             continue
         shipping_total, extra_shipping, shipping_discount = next(iter(signatures))
-        effective = shipping_total + extra_shipping
+        # 스마트스토어의 '배송비 합계'에는 제주/도서 추가배송비가 이미 포함된다.
+        # 별도 열은 검수용 상세값이므로 다시 더하면 도서산간 비용이 이중 계상된다.
+        effective = shipping_total
         if effective < 0:
-            issues.append(_issue(first, f"배송비 합계와 추가배송비의 합이 음수입니다: {effective}"))
+            issues.append(_issue(first, f"배송비 합계가 음수입니다: {effective}"))
             continue
         charges.append(
             ShippingCharge(
@@ -865,6 +877,36 @@ def write_ecount_workbook(
             "확인" if charge.is_adjusted else "일반",
         ])
     _style_review_sheet(review)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(path)
+
+
+def write_ecount_lines_workbook(
+    path: str | Path,
+    lines: list[VoucherLine],
+    voucher_date: date,
+    manager_code: str = "00109",
+    sheet_title: str = "이카운트 웹입력",
+) -> None:
+    """선택한 전표 행만 별도 창고 입력자료로 저장한다."""
+    workbook = Workbook()
+    upload = workbook.active
+    upload.title = sheet_title
+    headers = [
+        "일자", "순번", "거래처코드", "거래처명", "담당자", "출하창고", "거래유형", "통화", "환율", "계좌번호", "미수금",
+        "특이사항", "품목코드", "품목명", "규격", "수량", "단가", "외화금액", "공급가액", "부가세", "비고", "생산전표생성",
+    ]
+    upload.append(headers)
+    date_number = int(voucher_date.strftime("%Y%m%d"))
+    for index, line in enumerate(lines, start=2):
+        upload.append([
+            date_number, None, line.customer_code, line.customer_name, manager_code, line.warehouse, None, None, None, None, None, None,
+            line.item_code, line.item_name, None, float(line.quantity), float(line.unit_price), None,
+            f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}",
+            f"확인필요: {line.review_reason}" if line.needs_review else None,
+            None,
+        ])
+    _style_upload_sheet(upload, lines)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
 
