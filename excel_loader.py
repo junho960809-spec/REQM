@@ -18,7 +18,10 @@ COLUMN_ALIASES = {
     "address1": ["수령자주소", "주소", "수령인 주소1", "인수자 주소"],
     "address2": ["수령자주소2", "상세주소", "수령인 주소2"],
     "message": ["상세요구사항", "배송메세지", "배송메시지", "배송메시지2(한줄로)", "고객메시지"],
-    "phone": ["수령자휴대폰", "핸드폰", "휴대폰", "연락처", "수령인핸드폰번호", "수령인 핸드폰", "인수자 HP"],
+    "phone": [
+        "수령자휴대폰", "핸드폰", "휴대폰", "연락처", "수령인핸드폰번호",
+        "수령인 핸드폰", "수령인 전화번호", "인수자 HP",
+    ],
     "product_name": ["판매처상품명", "상품명", "품목명", "주문상품명(기간할인 제목+버전)"],
     "item_code": ["품목코드", "상품코드", "제품코드", "재고코드", "협력사상품코드", "SKU", "PROD_CD", "ITEM CODE"],
     "option1": ["상품옵션", "옵션", "속성명"],
@@ -31,6 +34,14 @@ COLUMN_ALIASES = {
 }
 
 REQUIRED = {"order_number", "recipient", "product_name", "quantity"}
+REQUIRED_SHIPPING_COLUMNS = {
+    "order_number", "product_name", "quantity", "recipient", "phone", "zipcode", "address1",
+}
+
+
+def missing_shipping_columns(columns: dict[str, int]) -> set[str]:
+    """Return fixed shipping fields that were not mapped from the input file."""
+    return REQUIRED_SHIPPING_COLUMNS - set(columns)
 
 B2C_PURCHASE_FORMAT = "B2C 사입형 출고건"
 B2C_PURCHASE_HEADERS = {

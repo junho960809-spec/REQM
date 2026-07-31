@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 from supabase import Client, create_client
 
-from excel_loader import COLUMN_ALIASES, load_orders, suggest_header_row
+from excel_loader import COLUMN_ALIASES, load_orders, missing_shipping_columns, suggest_header_row
 from matcher import ProductMatcher
 from matcher import compact
 from matcher import order_source_text
@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.20"
+APP_VERSION = "1.0.21"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -502,14 +502,16 @@ class FileFormatDialog(QDialog):
         ("option2", "추가 옵션"),
         ("model", "모델명"),
         ("channel", "판매처"),
-        ("phone", "연락처"),
-        ("zipcode", "우편번호"),
-        ("address1", "주소"),
+        ("phone", "연락처 *"),
+        ("zipcode", "우편번호 *"),
+        ("address1", "주소 *"),
         ("address2", "상세주소"),
         ("message", "배송메세지"),
         ("serial_number", "일련번호"),
     )
-    REQUIRED_KEYS = {"order_number", "product_name", "quantity", "recipient"}
+    REQUIRED_KEYS = {
+        "order_number", "product_name", "quantity", "recipient", "phone", "zipcode", "address1",
+    }
 
     def __init__(self, file_path: str, parent=None):
         super().__init__(parent)
@@ -1561,6 +1563,30 @@ class MainWindow(QMainWindow):
                     format_dialog = FileFormatDialog(path, self)
                     if format_dialog.exec() != QDialog.DialogCode.Accepted:
                         raise original_error
+                    orders, columns = load_orders(path, format_dialog.profile)
+                missing_columns = missing_shipping_columns(columns)
+                if missing_columns:
+                    labels = {
+                        "order_number": "주문번호",
+                        "product_name": "상품명",
+                        "quantity": "수량",
+                        "recipient": "수령인",
+                        "phone": "연락처",
+                        "zipcode": "우편번호",
+                        "address1": "주소",
+                    }
+                    missing_text = ", ".join(labels[key] for key in labels if key in missing_columns)
+                    QMessageBox.information(
+                        self,
+                        "입력 양식 연결 필요",
+                        "다음 출고 필수 열을 자동으로 찾지 못했습니다.\n"
+                        f"{missing_text}\n\n"
+                        "원본 파일의 열을 프로그램 출고 항목에 연결해 주세요. "
+                        "저장한 연결은 같은 양식의 다음 파일부터 자동 적용됩니다.",
+                    )
+                    format_dialog = FileFormatDialog(path, self)
+                    if format_dialog.exec() != QDialog.DialogCode.Accepted:
+                        raise ValueError("출고 필수 열 연결이 취소됐습니다.")
                     orders, columns = load_orders(path, format_dialog.profile)
                 for order in orders:
                     order.update(self.matcher.match(order))

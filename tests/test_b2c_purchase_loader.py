@@ -6,7 +6,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from excel_loader import B2C_PURCHASE_FORMAT, load_orders
+from excel_loader import B2C_PURCHASE_FORMAT, load_orders, missing_shipping_columns
 from output_format_store import B2C_PURCHASE_FORMAT as B2C_PURCHASE_OUTPUT
 from shipping_export import HEADERS as EXPORT_HEADERS, export_wekep, export_with_format
 
@@ -88,6 +88,41 @@ class B2CPurchaseLoaderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"2행 필수값 누락: 핸드폰\(J\)"):
             load_orders(str(path))
+
+    def test_recipient_phone_number_alias_is_loaded(self) -> None:
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / "seller_orders.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append([
+            "주문번호", "상품명", "수량", "수령인", "수령인 전화번호",
+            "우편번호", "주소",
+        ])
+        sheet.append([
+            "ORDER-1", "REQM 상품", 1, "홍길동", "010-4966-0448",
+            "01234", "서울시 중구 테스트로 1",
+        ])
+        workbook.save(path)
+        workbook.close()
+
+        orders, columns = load_orders(str(path))
+
+        self.assertEqual(orders[0]["phone"], "010-4966-0448")
+        self.assertEqual(missing_shipping_columns(columns), set())
+
+    def test_missing_shipping_columns_are_reported_for_mapping_popup(self) -> None:
+        columns = {
+            "order_number": 0,
+            "product_name": 1,
+            "quantity": 2,
+            "recipient": 3,
+        }
+
+        self.assertEqual(
+            missing_shipping_columns(columns),
+            {"phone", "zipcode", "address1"},
+        )
 
     def test_custom_output_template_clears_examples_and_uses_selected_columns(self) -> None:
         path = self.write_workbook(
