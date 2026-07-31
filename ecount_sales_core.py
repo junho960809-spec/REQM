@@ -834,15 +834,24 @@ def write_ecount_workbook(
     ]
     upload.append(headers)
     date_number = int(voucher_date.strftime("%Y%m%d"))
-    for index, line in enumerate(result.lines, start=2):
+    ordered_lines = sorted(
+        result.lines,
+        key=lambda line: (
+            0 if str(line.warehouse) == "100" else 1,
+            str(line.warehouse),
+            line.item_code,
+            line.unit_price,
+        ),
+    )
+    for index, line in enumerate(ordered_lines, start=2):
         upload.append([
-            date_number, None, line.customer_code, line.customer_name, manager_code, line.warehouse, None, None, None, None, None, None,
+            date_number, None, line.customer_code, None, manager_code, line.warehouse, None, None, None, None, None, None,
             line.item_code, line.item_name, None, float(line.quantity), float(line.unit_price), None,
             f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}",
             f"확인필요: {line.review_reason}" if line.needs_review else None,
             None,
         ])
-    _style_upload_sheet(upload, result.lines)
+    _style_upload_sheet(upload, ordered_lines)
 
     review = workbook.create_sheet("검수결과")
     review.append(["구분", "입력파일", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
@@ -898,15 +907,24 @@ def write_ecount_lines_workbook(
     ]
     upload.append(headers)
     date_number = int(voucher_date.strftime("%Y%m%d"))
-    for index, line in enumerate(lines, start=2):
+    ordered_lines = sorted(
+        lines,
+        key=lambda line: (
+            0 if str(line.warehouse) == "100" else 1,
+            str(line.warehouse),
+            line.item_code,
+            line.unit_price,
+        ),
+    )
+    for index, line in enumerate(ordered_lines, start=2):
         upload.append([
-            date_number, None, line.customer_code, line.customer_name, manager_code, line.warehouse, None, None, None, None, None, None,
+            date_number, None, line.customer_code, None, manager_code, line.warehouse, None, None, None, None, None, None,
             line.item_code, line.item_name, None, float(line.quantity), float(line.unit_price), None,
             f"=ROUND(Q{index}/1.1*P{index},0)", f"=Q{index}*P{index}-S{index}",
             f"확인필요: {line.review_reason}" if line.needs_review else None,
             None,
         ])
-    _style_upload_sheet(upload, lines)
+    _style_upload_sheet(upload, ordered_lines)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
 

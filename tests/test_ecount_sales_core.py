@@ -80,14 +80,18 @@ class SalesCoreTests(unittest.TestCase):
             item_total=Decimal("34900"),
         )
         result = convert_orders([order], self.catalog)
+        result.lines[-1].warehouse = "100"
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "output.xlsx"
             write_ecount_workbook(output, result, date(2026, 7, 22))
             workbook = load_workbook(output, data_only=False)
             sheet = workbook["이카운트 웹입력"]
             self.assertEqual(sheet["A2"].value, 20260722)
+            self.assertIsNone(sheet["D2"].value)
+            self.assertIsNone(sheet["D3"].value)
             self.assertEqual(sheet["E2"].value, "00109")
-            self.assertEqual(sheet["F2"].value, "300")
+            self.assertEqual(sheet["F2"].value, "100")
+            self.assertEqual(sheet["F3"].value, "300")
             self.assertEqual(sheet["S2"].value, "=ROUND(Q2/1.1*P2,0)")
             self.assertEqual(sheet["T2"].value, "=Q2*P2-S2")
             workbook.close()

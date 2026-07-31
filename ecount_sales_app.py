@@ -595,6 +595,7 @@ class SpecialLinesDialog(QDialog):
     def __init__(self, lines: list[VoucherLine], voucher_date: date, manager_code: str, parent=None) -> None:
         super().__init__(parent)
         self.lines = lines
+        self.removed_codes: set[str] = set()
         self.voucher_date = voucher_date
         self.manager_code = manager_code
         self.setWindowTitle("본사출고 품목")
@@ -632,10 +633,40 @@ class SpecialLinesDialog(QDialog):
         self.search.textChanged.connect(self._filter)
         layout.addWidget(self.table)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        remove_button = buttons.addButton("선택 품목 본사출고 해제", QDialogButtonBox.ActionRole)
         export_button = buttons.addButton("본사출고 Excel 저장", QDialogButtonBox.ActionRole)
+        remove_button.clicked.connect(self._remove_selected)
         export_button.clicked.connect(self._export)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _remove_selected(self) -> None:
+        selected_rows = sorted({index.row() for index in self.table.selectedIndexes()})
+        if not selected_rows and self.table.currentRow() >= 0:
+            selected_rows = [self.table.currentRow()]
+        codes = {
+            self.table.item(row, 0).text()
+            for row in selected_rows
+            if self.table.item(row, 0) is not None
+        }
+        if not codes:
+            QMessageBox.information(self, "선택 필요", "본사출고에서 해제할 품목을 선택해주세요.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "본사출고 지정 해제",
+            f"{len(codes):,}개 품목을 본사출고 대상에서 해제하고 기본창고로 되돌릴까요?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.removed_codes.update(codes)
+        self.lines = [line for line in self.lines if line.item_code not in codes]
+        for row in range(self.table.rowCount() - 1, -1, -1):
+            item = self.table.item(row, 0)
+            if item is not None and item.text() in codes:
+                self.table.removeRow(row)
 
     def _filter(self, text: str) -> None:
         keyword = (text or "").strip().casefold()
@@ -997,7 +1028,7 @@ class SalesVoucherWindow(QMainWindow):
         add_db_button = QPushButton("DB에 단품 바로 추가")
         add_db_button.clicked.connect(self.add_selected_issue_to_db)
         bottom.addWidget(add_db_button)
-        special_select_button = QPushButton("본사출고 품목 지정")
+        special_select_button = QPushButton("본사출고 품목 지정·수정")
         special_view_button = QPushButton("본사출고 보기·저장")
         special_select_button.clicked.connect(self.select_special_items)
         special_view_button.clicked.connect(self.open_special_items)
@@ -1540,6 +1571,19 @@ class SalesVoucherWindow(QMainWindow):
             self,
         )
         dialog.exec()
+        if dialog.removed_codes:
+            self.special_item_codes.difference_update(dialog.removed_codes)
+            try:
+                save_code_set(SPECIAL_ITEMS_PATH, self.special_item_codes)
+            except Exception as exc:
+                QMessageBox.critical(self, "설정 저장 실패", str(exc))
+                return
+            self._apply_special_warehouses()
+            self._show_result(self.current_result)
+            self.db_status.setText(
+                f"본사출고 품목 {len(dialog.removed_codes):,}개 해제 · 기본창고 복원"
+            )
+            self.db_status.setStyleSheet("color:#047857;font-weight:600;")
 
     def delete_local_db_items(self) -> None:
         source_catalog = self.base_catalog or self.catalog
