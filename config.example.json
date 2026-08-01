@@ -1,4 +1,15 @@
 {
   "supabase_url": "https://prbyoxzowkycjjqxpsft.supabase.co",
-  "supabase_publishable_key": "여기에 Supabase publishable 또는 anon 키 입력"
+  "supabase_publishable_key": "여기에 Supabase publishable 또는 anon 키 입력",
+  "ecount": {
+    "company_code": "304293",
+    "user_id": "이카운트 사용자 ID",
+    "zone": "AB",
+    "employee_code": "00210",
+    "source_warehouse": "100",
+    "target_warehouse": "300",
+    "target_channel": "",
+    "test_mode": false,
+    "remarks": "REQM 출고 창고이동"
+  }
 }

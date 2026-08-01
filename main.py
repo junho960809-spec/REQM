@@ -47,6 +47,8 @@ from location_store import load_locations, save_locations
 from format_store import upsert_format
 from output_format_store import delete_output_format, load_output_formats, save_custom_output_format
 from direct_suggester import component_payload, components_text, suggest_direct_order
+from ecount_dialog import EcountTransferDialog
+from ecount_client import load_completed_transfer_requests
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -54,9 +56,20 @@ CONFIG_PATH = APP_DIR / "config.json"
 DEFAULT_CONFIG = {
     "supabase_url": "https://jcslohuraqclhryeqxoc.supabase.co",
     "supabase_publishable_key": "sb_publishable_dafbXHpLHVPDhsMwm_B5RA_LgCqlWeg",
+    "ecount": {
+        "company_code": "304293",
+        "user_id": "",
+        "zone": "AB",
+        "employee_code": "",
+        "source_warehouse": "100",
+        "target_warehouse": "300",
+        "target_channel": "",
+        "test_mode": False,
+        "remarks": "REQM 출고 창고이동",
+    },
 }
 ADMIN_USER_ID = "c7937d51-1a14-47aa-987e-6254c6c79014"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.26"
 UPDATE_BASE_URL = "https://jcslohuraqclhryeqxoc.supabase.co/storage/v1/object/public/reqm-updates"
 UPDATE_MANIFEST_URL = f"{UPDATE_BASE_URL}/manifest.json"
 
@@ -885,8 +898,12 @@ class CorrectionDialog(QDialog):
 
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
-        return DEFAULT_CONFIG
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return json.loads(json.dumps(DEFAULT_CONFIG))
+    loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    config.update({key: value for key, value in loaded.items() if key != "ecount"})
+    config["ecount"].update(loaded.get("ecount") or {})
+    return config
 
 
 def fetch_all_rows(client: Client, table: str, page_size: int = 1000) -> list[dict]:
@@ -987,6 +1004,7 @@ class MainWindow(QMainWindow):
         self.catalog: dict = {}
         self.current_mode = "parcel"
         self.current_orders: list[dict[str, str]] = []
+        self.completed_ecount_requests = load_completed_transfer_requests()
         self.duty_locations = load_locations()
         self.selected_location_name = ""
         self.is_admin = False
@@ -1064,6 +1082,9 @@ class MainWindow(QMainWindow):
         self.export_button = QPushButton("택배 출고용 변환")
         self.export_button.setObjectName("exportButton")
         self.export_button.setEnabled(False)
+        self.ecount_button = QPushButton("이카운트 창고이동")
+        self.ecount_button.setObjectName("exportButton")
+        self.ecount_button.setEnabled(False)
         self.output_format_combo = QComboBox()
         self.output_format_combo.setMinimumWidth(220)
         self.output_format_manage_button = QPushButton("출력 양식 관리")
@@ -1172,6 +1193,7 @@ class MainWindow(QMainWindow):
         export_row.addWidget(self.output_format_combo)
         export_row.addWidget(self.output_format_manage_button)
         export_row.addStretch(1)
+        export_row.addWidget(self.ecount_button)
         export_row.addWidget(self.export_button)
         layout.addLayout(export_row)
         container = QWidget()
@@ -1188,6 +1210,7 @@ class MainWindow(QMainWindow):
         self.auto_button.clicked.connect(lambda: self.select_file("auto"))
         self.db_button.clicked.connect(self.open_db_manager)
         self.export_button.clicked.connect(self.export_file)
+        self.ecount_button.clicked.connect(self.open_ecount_transfer)
         self.output_format_manage_button.clicked.connect(self.manage_output_formats)
         self.location_manage_button.clicked.connect(self.manage_locations)
         self.location_apply_button.clicked.connect(self.apply_location)
@@ -1278,6 +1301,7 @@ class MainWindow(QMainWindow):
         self.catalog = catalog
         self.is_admin = catalog.get("app_role") == "admin"
         self.db_button.setEnabled(self.is_admin)
+        self.ecount_button.setEnabled(self.is_admin and bool(self.current_orders))
         self.matcher = ProductMatcher(catalog["items"], catalog["products"], catalog["components"], catalog["aliases"])
         self.login_row.removeWidget(self.login_button)
         self.login_card.hide()
@@ -1320,6 +1344,7 @@ class MainWindow(QMainWindow):
         self.b2c_button.setEnabled(False)
         self.b2b_button.setEnabled(False)
         self.export_button.setEnabled(False)
+        self.ecount_button.setEnabled(False)
         self.header_row.removeWidget(self.login_button)
         self.login_row.addWidget(self.login_button)
         self.login_button.setText("로그인")
@@ -1622,6 +1647,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "파일 분석 실패", str(exc))
             return
         self.current_orders = orders
+        self.ecount_button.setEnabled(self.is_admin and bool(self.current_orders))
         self.populate_table(self.current_orders)
         counts = {key: sum(1 for row in orders if row.get("status") == key) for key in ("exact", "similar", "ambiguous", "missing", "barcode_error")}
         self.status.setText(
@@ -1833,6 +1859,25 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "이력 저장 안내", f"Excel은 저장됐지만 중복 방지 이력을 Supabase에 기록하지 못했습니다.\n관리자용 SQL 적용 여부를 확인하세요.\n{exc}")
         QMessageBox.information(self, "저장 완료", f"위킵 출고 파일을 저장했습니다.\n{file_path}")
+
+    def open_ecount_transfer(self) -> None:
+        if not self.is_admin:
+            QMessageBox.warning(self, "권한 없음", "이카운트 창고이동은 관리자만 실행할 수 있습니다.")
+            return
+        if not self.current_orders:
+            QMessageBox.warning(self, "주문 없음", "먼저 출고 주문 파일을 분석하세요.")
+            return
+        dialog = EcountTransferDialog(
+            self.current_orders,
+            self.catalog.get("items", []),
+            load_config().get("ecount", {}),
+            self.completed_ecount_requests,
+            self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.status.setText(
+                f"이카운트 창고이동 완료 · {dialog.transfer_scope} · 집계 품목 {len(dialog.items):,}개"
+            )
 
 if __name__ == "__main__":
     remove_legacy_transfer_credentials()
