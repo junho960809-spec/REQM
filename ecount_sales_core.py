@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import re
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -78,6 +78,7 @@ class SmartStoreOrder:
     final_item_total: Decimal | None = None
     source_type: str = "원본"
     include_shipping: bool = True
+    purchaser_name: str = ""
 
     @property
     def normalized_source(self) -> str:
@@ -108,6 +109,19 @@ class VoucherLine:
     @property
     def total(self) -> Decimal:
         return (self.quantity * self.unit_price).quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+@dataclass
+class ItemOrderDetail:
+    order_no: str
+    product_order_no: str
+    purchaser_name: str
+    product_name: str
+    options: str
+    order_quantity: Decimal
+    converted_quantity: Decimal
+    warehouse: str
+    source_type: str
 
 
 @dataclass
@@ -404,6 +418,13 @@ def read_smartstore_orders_range(
                     shipping_discount=as_decimal(row[indexes["배송비 할인액"]]) if "배송비 할인액" in indexes else Decimal("0"),
                     initial_item_total=initial_amount,
                     final_item_total=final_amount,
+                    purchaser_name=str(
+                        row[indexes["구매자명"]]
+                        if "구매자명" in indexes
+                        else row[indexes["수취인명"]]
+                        if "수취인명" in indexes
+                        else ""
+                    ).strip(),
                 )
             )
         return result
@@ -488,6 +509,13 @@ def read_purchase_confirmed_orders(path: str | Path) -> list[SmartStoreOrder]:
                     final_item_total=amount,
                     source_type="구매확정",
                     include_shipping=True,
+                    purchaser_name=str(
+                        row[indexes["구매자명"]]
+                        if "구매자명" in indexes
+                        else row[indexes["수취인명"]]
+                        if "수취인명" in indexes
+                        else ""
+                    ).strip(),
                 )
             )
         if not result:
@@ -652,6 +680,45 @@ def convert_orders(
             current.source_orders.extend(line.source_orders)
     lines = sorted(aggregated.values(), key=lambda row: (row.item_code, row.unit_price, row.warehouse))
     return ConversionResult(orders=orders, lines=lines, issues=issues, shipping_charges=shipping_charges)
+
+
+def build_item_order_details(
+    orders: list[SmartStoreOrder],
+    catalog: ReferenceCatalog,
+    item_code: str,
+    unit_price: Decimal | None = None,
+    default_warehouse: str = "300",
+) -> list[ItemOrderDetail]:
+    """선택 품목이 각 주문에서 몇 개로 변환됐는지 주문 단위로 계산한다."""
+    details: list[ItemOrderDetail] = []
+    for order in orders:
+        isolated = replace(
+            order,
+            include_shipping=False,
+            shipping_total=Decimal("0"),
+            extra_shipping=Decimal("0"),
+            shipping_discount=Decimal("0"),
+        )
+        converted = convert_orders([isolated], catalog, default_warehouse=default_warehouse)
+        for line in converted.lines:
+            if line.item_code != item_code:
+                continue
+            if unit_price is not None and line.unit_price != unit_price:
+                continue
+            details.append(
+                ItemOrderDetail(
+                    order_no=order.order_no,
+                    product_order_no=order.product_order_no,
+                    purchaser_name=order.purchaser_name,
+                    product_name=order.product_name,
+                    options=order.options,
+                    order_quantity=order.quantity,
+                    converted_quantity=line.quantity,
+                    warehouse=line.warehouse,
+                    source_type=order.source_type,
+                )
+            )
+    return details
 
 
 def _collect_shipping_charges(

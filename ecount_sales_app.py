@@ -42,6 +42,7 @@ from supabase import ClientOptions, create_client
 
 from ecount_sales_core import (
     combine_order_sources,
+    build_item_order_details,
     ConversionResult,
     ReferenceCatalog,
     SmartStoreOrder,
@@ -695,6 +696,86 @@ class SpecialLinesDialog(QDialog):
             QMessageBox.critical(self, "저장 실패", str(exc))
 
 
+def mask_person_name(name: str) -> str:
+    text = (name or "").strip()
+    if not text:
+        return "-"
+    if len(text) == 1:
+        return "*"
+    if len(text) == 2:
+        return f"{text[0]}*"
+    return f"{text[0]}{'*' * (len(text) - 2)}{text[-1]}"
+
+
+class ItemOrderDetailsDialog(QDialog):
+    def __init__(self, item_code: str, item_name: str, details: list, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("품목 주문 상세")
+        self.resize(1080, 620)
+        layout = QVBoxLayout(self)
+        order_count = len({(row.order_no, row.product_order_no) for row in details})
+        total_quantity = sum((row.converted_quantity for row in details), Decimal("0"))
+        summary = QLabel(
+            f"품목코드  {item_code}    |    품목명  {item_name}    |    "
+            f"주문건수  {order_count:,}건    |    합계 수량  {total_quantity:,.0f}개"
+        )
+        summary.setStyleSheet(
+            "background:#F0F7FF;border:1px solid #BFDBFE;border-radius:7px;"
+            "padding:12px;font-size:11pt;font-weight:700;color:#173F5F;"
+        )
+        layout.addWidget(summary)
+        search = QLineEdit()
+        search.setPlaceholderText("주문번호, 주문자명, 상품명, 옵션 검색")
+        search.setClearButtonEnabled(True)
+        layout.addWidget(search)
+        table = QTableWidget(0, 7)
+        table.setHorizontalHeaderLabels(
+            ["주문번호", "주문자명", "원본 상품명", "옵션", "주문 수량", "환산 수량", "출고창고"]
+        )
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        for column in range(4, 7):
+            table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.setRowCount(len(details))
+        for row_index, detail in enumerate(details):
+            values = [
+                detail.order_no,
+                mask_person_name(detail.purchaser_name),
+                detail.product_name,
+                detail.options,
+                detail.order_quantity,
+                detail.converted_quantity,
+                detail.warehouse,
+            ]
+            for column, value in enumerate(values):
+                item = NumericTableWidgetItem(value) if column in {4, 5} else QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if column >= 4:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                table.setItem(row_index, column, item)
+        table.setSortingEnabled(True)
+        layout.addWidget(table)
+
+        def apply_filter(text: str) -> None:
+            keyword = (text or "").strip().casefold()
+            for row in range(table.rowCount()):
+                searchable = " ".join(
+                    table.item(row, column).text()
+                    for column in range(4)
+                    if table.item(row, column) is not None
+                ).casefold()
+                table.setRowHidden(row, bool(keyword and keyword not in searchable))
+
+        search.textChanged.connect(apply_filter)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -854,7 +935,11 @@ class SalesVoucherWindow(QMainWindow):
         for column in range(2, 7):
             self.lines_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.lines_table.setAlternatingRowColors(True)
-        self.lines_table.setSortingEnabled(False)
+        self.lines_table.setSortingEnabled(True)
+        self.lines_table.horizontalHeader().setToolTip(
+            "품목코드 또는 품목명 제목을 클릭하면 오름차순·내림차순으로 정렬됩니다."
+        )
+        self.lines_table.cellDoubleClicked.connect(self.open_result_order_details)
         result_tab = QWidget()
         result_layout = QVBoxLayout(result_tab)
         result_layout.setContentsMargins(5, 5, 5, 5)
@@ -885,6 +970,7 @@ class SalesVoucherWindow(QMainWindow):
             self.pivot_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.pivot_table.setAlternatingRowColors(True)
         self.pivot_table.setSortingEnabled(True)
+        self.pivot_table.cellDoubleClicked.connect(self.open_pivot_order_details)
         pivot_tab = QWidget()
         pivot_layout = QVBoxLayout(pivot_tab)
         pivot_layout.setContentsMargins(5, 5, 5, 5)
@@ -1298,7 +1384,12 @@ class SalesVoucherWindow(QMainWindow):
             if line.needs_review:
                 editable_columns.update({0, 1})
             for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                item = (
+                    NumericTableWidgetItem(Decimal(value.replace(",", "")))
+                    if column in {2, 3, 4, 6}
+                    else QTableWidgetItem(value)
+                )
+                item.setData(Qt.UserRole, row_index)
                 if column not in editable_columns:
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 else:
@@ -1309,7 +1400,7 @@ class SalesVoucherWindow(QMainWindow):
                 if column in {2, 3, 4, 6}:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.lines_table.setItem(row_index, column, item)
-        self.lines_table.setSortingEnabled(False)
+        self.lines_table.setSortingEnabled(True)
         self.filter_result_lines(self.result_search.text())
         self._show_pivot_result(result)
 
@@ -1405,6 +1496,72 @@ class SalesVoucherWindow(QMainWindow):
                 self.pivot_table.setItem(row, column, item)
         self.pivot_table.setSortingEnabled(True)
         self._reapply_table_filters(self.pivot_table)
+
+    def open_result_order_details(self, table_row: int, _column: int = 0) -> None:
+        if self.current_result is None or self.catalog is None:
+            return
+        index_item = self.lines_table.item(table_row, 0)
+        if index_item is None:
+            return
+        original_index = index_item.data(Qt.UserRole)
+        if original_index is None or not (0 <= int(original_index) < len(self.current_result.lines)):
+            return
+        line = self.current_result.lines[int(original_index)]
+        self._open_item_order_details(
+            line.item_code,
+            line.item_name,
+            line.unit_price,
+            set(line.source_orders),
+        )
+
+    def open_pivot_order_details(self, table_row: int, _column: int = 0) -> None:
+        code_item = self.pivot_table.item(table_row, 0)
+        name_item = self.pivot_table.item(table_row, 1)
+        if code_item is None or name_item is None:
+            return
+        source_orders = {
+            order_no
+            for line in self.current_result.lines
+            if line.item_code == code_item.text()
+            for order_no in line.source_orders
+        } if self.current_result is not None else set()
+        self._open_item_order_details(code_item.text(), name_item.text(), None, source_orders)
+
+    def _open_item_order_details(
+        self,
+        item_code: str,
+        item_name: str,
+        unit_price: Decimal | None,
+        source_order_nos: set[str] | None = None,
+    ) -> None:
+        if self.current_result is None or self.catalog is None:
+            return
+        if item_code == "택배운송비":
+            QMessageBox.information(
+                self,
+                "배송비 상세",
+                "배송비 주문별 정보는 배송비 검수 탭에서 묶음번호 기준으로 확인해주세요.",
+            )
+            return
+        relevant_orders = (
+            [order for order in self.current_result.orders if order.order_no in source_order_nos]
+            if source_order_nos
+            else self.current_result.orders
+        )
+        details = build_item_order_details(
+            relevant_orders,
+            self.catalog,
+            item_code,
+            unit_price,
+            str(self.default_warehouse.value()),
+        )
+        for detail in details:
+            if item_code in self.special_item_codes or "QM4100" in f"{item_code} {item_name}".upper():
+                detail.warehouse = "100"
+        if not details:
+            QMessageBox.information(self, "주문 상세", "연결된 원본 주문을 찾지 못했습니다.")
+            return
+        ItemOrderDetailsDialog(item_code, item_name, details, self).exec()
 
     def _refresh_db_management(self) -> None:
         if self.catalog is None:
@@ -1903,9 +2060,11 @@ class SalesVoucherWindow(QMainWindow):
 
     def _apply_table_edits(self) -> None:
         assert self.current_result is not None
-        updated: list[VoucherLine] = []
+        updated: dict[int, VoucherLine] = {}
         for row in range(self.lines_table.rowCount()):
-            original = self.current_result.lines[row]
+            index_item = self.lines_table.item(row, 0)
+            original_index = int(index_item.data(Qt.UserRole))
+            original = self.current_result.lines[original_index]
             quantity = Decimal(self.lines_table.item(row, 2).text().replace(",", ""))
             unit_price = Decimal(self.lines_table.item(row, 3).text().replace(",", ""))
             warehouse = self.lines_table.item(row, 5).text().strip()
@@ -1915,8 +2074,7 @@ class SalesVoucherWindow(QMainWindow):
                 raise ValueError(f"{row + 1}행 단가는 0 이상의 원 단위 정수여야 합니다.")
             if not warehouse:
                 raise ValueError(f"{row + 1}행 창고가 비어 있습니다.")
-            updated.append(
-                VoucherLine(
+            updated[original_index] = VoucherLine(
                     customer_code=original.customer_code,
                     customer_name=original.customer_name,
                     item_code=self.lines_table.item(row, 0).text().strip(),
@@ -1929,9 +2087,8 @@ class SalesVoucherWindow(QMainWindow):
                     is_shipping=original.is_shipping,
                     needs_review=original.needs_review,
                     review_reason=original.review_reason,
-                )
             )
-        self.current_result.lines = updated
+        self.current_result.lines = [updated[index] for index in range(len(self.current_result.lines))]
 
     def remove_selected_issues(self) -> None:
         if self.current_result is None or self.catalog is None:

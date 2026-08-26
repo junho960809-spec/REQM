@@ -9,6 +9,7 @@ from pathlib import Path
 from openpyxl import load_workbook
 
 from ecount_sales_core import (
+    build_item_order_details,
     combine_order_sources,
     ReferenceCatalog,
     SmartStoreOrder,
@@ -66,6 +67,26 @@ class SalesCoreTests(unittest.TestCase):
         self.assertEqual(by_code["OPTION"].unit_price, Decimal("6900.00"))
         self.assertEqual(result.input_total, result.output_total)
         self.assertEqual(result.issues, [])
+
+    def test_item_order_details_keep_buyer_and_converted_quantity(self) -> None:
+        order = SmartStoreOrder(
+            source_row=2,
+            order_no="ORDER-DETAIL",
+            product_order_no="PRODUCT-DETAIL",
+            paid_at=datetime(2026, 7, 21, 10, 0),
+            status="구매확정",
+            product_name="상품 세트",
+            options="옵션 핑크",
+            quantity=Decimal("2"),
+            item_total=Decimal("69800"),
+            purchaser_name="김민희",
+        )
+        details = build_item_order_details([order], self.catalog, "OPTION")
+        self.assertEqual(len(details), 1)
+        self.assertEqual(details[0].order_no, "ORDER-DETAIL")
+        self.assertEqual(details[0].purchaser_name, "김민희")
+        self.assertEqual(details[0].order_quantity, Decimal("2"))
+        self.assertEqual(details[0].converted_quantity, Decimal("2"))
 
     def test_export_uses_voucher_date_and_tax_formulas(self) -> None:
         order = SmartStoreOrder(
