@@ -55,6 +55,7 @@ from ecount_sales_core import (
     write_ecount_workbook,
     write_ecount_lines_workbook,
 )
+from ecount_sales_api_dialog import EcountSalesApiDialog
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
@@ -64,6 +65,18 @@ LOCAL_DATA_DIR = BUNDLE_DIR / "supabase" / "ecount_migration" / "data"
 DB_LOG_PATH = APP_DIR / "db_connection.log"
 SPECIAL_ITEMS_PATH = APP_DIR / "special_warehouse_items.json"
 DELETED_ITEMS_PATH = APP_DIR / "deleted_db_items.json"
+
+
+def search_text_matches(keyword: str, searchable: str) -> bool:
+    """공백·하이픈·밑줄 차이를 무시하고 코드와 주문번호를 검색한다."""
+    raw_keyword = (keyword or "").strip().casefold()
+    if not raw_keyword:
+        return True
+    raw_searchable = (searchable or "").casefold()
+    if raw_keyword in raw_searchable:
+        return True
+    normalized_keyword = normalize_source(raw_keyword)
+    return bool(normalized_keyword and normalized_keyword in normalize_source(raw_searchable))
 
 
 def load_code_set(path: Path) -> set[str]:
@@ -592,40 +605,69 @@ class ItemChecklistDialog(QDialog):
         }
 
 
-class SpecialLinesDialog(QDialog):
-    def __init__(self, lines: list[VoucherLine], voucher_date: date, manager_code: str, parent=None) -> None:
+class WarehouseLinesDialog(QDialog):
+    def __init__(
+        self,
+        lines: list[VoucherLine],
+        voucher_date: date,
+        manager_code: str,
+        warehouse_code: str,
+        warehouse_label: str,
+        allow_release: bool = False,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.lines = lines
         self.removed_codes: set[str] = set()
         self.voucher_date = voucher_date
         self.manager_code = manager_code
-        self.setWindowTitle("본사출고 품목")
-        self.resize(850, 520)
+        self.warehouse_code = warehouse_code
+        self.warehouse_label = warehouse_label
+        self.allow_release = allow_release
+        self.setWindowTitle(f"{warehouse_label} 출고")
+        self.resize(1050, 560)
         layout = QVBoxLayout(self)
         total_quantity = sum((line.quantity for line in lines), Decimal("0"))
         total_amount = sum((line.total for line in lines), Decimal("0"))
         summary = QLabel(
-            f"품목행 {len(lines):,}개 · 수량 {total_quantity:,.0f}개 · 금액 {total_amount:,.0f}원 "
+            f"창고 {warehouse_code} · 품목행 {len(lines):,}개 · 수량 {total_quantity:,.0f}개 · "
+            f"금액 {total_amount:,.0f}원 "
             "(전체 전표 총액에는 그대로 포함)"
         )
         summary.setStyleSheet("font-weight:700;color:#0F766E;")
         layout.addWidget(summary)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("품목코드·품목명·창고 검색")
+        self.search.setPlaceholderText("품목코드·품목명·주문번호 검색")
         self.search.setClearButtonEnabled(True)
         layout.addWidget(self.search)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["품목코드", "품목명", "수량", "단가", "금액"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["품목코드", "품목명", "수량", "단가", "금액", "주문건수", "주문번호"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in range(2, 5):
+        for column in range(2, 6):
             self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(lines))
         for row, line in enumerate(lines):
-            values = [line.item_code, line.item_name, line.quantity, line.unit_price, line.total]
+            order_numbers = list(dict.fromkeys(line.source_orders))
+            values = [
+                line.item_code,
+                line.item_name,
+                line.quantity,
+                line.unit_price,
+                line.total,
+                len(order_numbers),
+                ", ".join(order_numbers),
+            ]
             for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value)) if column < 2 else NumericTableWidgetItem(value)
+                item = (
+                    NumericTableWidgetItem(value)
+                    if column in {2, 3, 4, 5}
+                    else QTableWidgetItem(str(value))
+                )
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 if column >= 2:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -634,9 +676,10 @@ class SpecialLinesDialog(QDialog):
         self.search.textChanged.connect(self._filter)
         layout.addWidget(self.table)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        remove_button = buttons.addButton("선택 품목 본사출고 해제", QDialogButtonBox.ActionRole)
-        export_button = buttons.addButton("본사출고 Excel 저장", QDialogButtonBox.ActionRole)
-        remove_button.clicked.connect(self._remove_selected)
+        if allow_release:
+            remove_button = buttons.addButton("선택 품목 본사출고 해제", QDialogButtonBox.ActionRole)
+            remove_button.clicked.connect(self._remove_selected)
+        export_button = buttons.addButton(f"{warehouse_label} Excel 저장", QDialogButtonBox.ActionRole)
         export_button.clicked.connect(self._export)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -670,28 +713,34 @@ class SpecialLinesDialog(QDialog):
                 self.table.removeRow(row)
 
     def _filter(self, text: str) -> None:
-        keyword = (text or "").strip().casefold()
+        keyword = (text or "").strip()
         for row in range(self.table.rowCount()):
             searchable = " ".join(
                 self.table.item(row, column).text()
-                for column in range(2)
+                for column in range(self.table.columnCount())
                 if self.table.item(row, column) is not None
-            ).casefold()
-            self.table.setRowHidden(row, bool(keyword and keyword not in searchable))
+            )
+            self.table.setRowHidden(row, not search_text_matches(keyword, searchable))
 
     def _export(self) -> None:
         if not self.lines:
-            QMessageBox.information(self, "대상 없음", "저장할 본사출고 품목이 없습니다.")
+            QMessageBox.information(self, "대상 없음", f"저장할 {self.warehouse_label} 품목이 없습니다.")
             return
-        suggested = f"본사출고_이카운트_판매전표_{self.voucher_date:%Y%m%d}.xlsx"
-        path, _ = QFileDialog.getSaveFileName(self, "본사출고 Excel 저장", suggested, "Excel 파일 (*.xlsx)")
+        suggested = f"{self.warehouse_label}_이카운트_판매전표_{self.voucher_date:%Y%m%d}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"{self.warehouse_label} Excel 저장", suggested, "Excel 파일 (*.xlsx)"
+        )
         if not path:
             return
         if not path.lower().endswith(".xlsx"):
             path += ".xlsx"
         try:
-            write_ecount_lines_workbook(path, self.lines, self.voucher_date, self.manager_code, "본사출고")
-            QMessageBox.information(self, "저장 완료", f"본사출고 품목만 저장했습니다.\n{path}")
+            write_ecount_lines_workbook(
+                path, self.lines, self.voucher_date, self.manager_code, self.warehouse_label
+            )
+            QMessageBox.information(
+                self, "저장 완료", f"{self.warehouse_label} 품목만 저장했습니다.\n{path}"
+            )
         except Exception as exc:
             QMessageBox.critical(self, "저장 실패", str(exc))
 
@@ -836,6 +885,8 @@ class SalesVoucherWindow(QMainWindow):
         self.db_rules_table = QTableWidget(0, 7)
         self.export_button = QPushButton("이카운트 Excel 저장")
         self.export_button.setEnabled(False)
+        self.ecount_api_button = QPushButton("이카운트 판매전표 입력")
+        self.ecount_api_button.setEnabled(False)
         self._build_ui()
         self._load_local_catalog()
 
@@ -945,14 +996,16 @@ class SalesVoucherWindow(QMainWindow):
         result_layout.setContentsMargins(5, 5, 5, 5)
         result_layout.setSpacing(5)
         result_search_layout = QHBoxLayout()
-        result_search_layout.addWidget(QLabel("품목 검색"))
-        self.result_filter_column.addItems(["전체 열", "품목코드", "품목명", "수량", "단가", "금액", "창고", "주문건수"])
+        result_search_layout.addWidget(QLabel("결과 검색"))
+        self.result_filter_column.addItems(
+            ["전체 열", "품목코드", "품목명", "수량", "단가", "금액", "창고", "주문건수", "주문번호"]
+        )
         self.result_filter_column.currentIndexChanged.connect(
             lambda: self.filter_result_lines(self.result_search.text())
         )
         result_search_layout.addWidget(self.result_filter_column)
         self.result_search = QLineEdit()
-        self.result_search.setPlaceholderText("품목코드 또는 품목명의 일부를 입력하세요")
+        self.result_search.setPlaceholderText("품목코드·품목명·주문번호의 일부를 입력하세요")
         self.result_search.setClearButtonEnabled(True)
         self.result_search.textChanged.connect(self.filter_result_lines)
         result_search_layout.addWidget(self.result_search, 1)
@@ -1115,12 +1168,17 @@ class SalesVoucherWindow(QMainWindow):
         add_db_button.clicked.connect(self.add_selected_issue_to_db)
         bottom.addWidget(add_db_button)
         special_select_button = QPushButton("본사출고 품목 지정·수정")
-        special_view_button = QPushButton("본사출고 보기·저장")
+        headquarters_view_button = QPushButton("본사창고 출고")
+        wekeep_view_button = QPushButton("위킵창고 출고")
         special_select_button.clicked.connect(self.select_special_items)
-        special_view_button.clicked.connect(self.open_special_items)
+        headquarters_view_button.clicked.connect(self.open_headquarters_lines)
+        wekeep_view_button.clicked.connect(self.open_wekeep_lines)
         bottom.addWidget(special_select_button)
-        bottom.addWidget(special_view_button)
+        bottom.addWidget(headquarters_view_button)
+        bottom.addWidget(wekeep_view_button)
         bottom.addStretch()
+        self.ecount_api_button.clicked.connect(self.open_ecount_sales_api)
+        bottom.addWidget(self.ecount_api_button)
         self.export_button.clicked.connect(self.export_excel)
         bottom.addWidget(self.export_button)
         layout.addLayout(bottom)
@@ -1351,6 +1409,7 @@ class SalesVoucherWindow(QMainWindow):
             self._apply_special_warehouses()
             self._show_result(self.current_result)
             self.export_button.setEnabled(bool(self.current_result.lines))
+            self.ecount_api_button.setEnabled(bool(self.current_result.lines))
         except Exception as exc:
             QMessageBox.critical(self, "분석 실패", str(exc))
         finally:
@@ -1445,17 +1504,33 @@ class SalesVoucherWindow(QMainWindow):
         self._reapply_table_filters(self.shipping_table)
 
     def filter_result_lines(self, text: str) -> None:
-        keyword = (text or "").strip().casefold()
+        keyword = (text or "").strip()
         selected = self.result_filter_column.currentIndex() - 1
+        order_number_filter = selected == self.lines_table.columnCount()
         visible = 0
         for row in range(self.lines_table.rowCount()):
-            columns = range(self.lines_table.columnCount()) if selected < 0 else (selected,)
-            searchable = " ".join(
-                self.lines_table.item(row, column).text()
-                for column in columns
-                if self.lines_table.item(row, column) is not None
-            ).casefold()
-            show = not keyword or keyword in searchable
+            order_numbers = ""
+            index_item = self.lines_table.item(row, 0)
+            original_index = index_item.data(Qt.UserRole) if index_item is not None else None
+            if (
+                self.current_result is not None
+                and original_index is not None
+                and 0 <= int(original_index) < len(self.current_result.lines)
+            ):
+                order_numbers = " ".join(self.current_result.lines[int(original_index)].source_orders)
+
+            if order_number_filter:
+                searchable = order_numbers
+            else:
+                columns = range(self.lines_table.columnCount()) if selected < 0 else (selected,)
+                searchable = " ".join(
+                    self.lines_table.item(row, column).text()
+                    for column in columns
+                    if self.lines_table.item(row, column) is not None
+                )
+                if selected < 0:
+                    searchable = f"{searchable} {order_numbers}"
+            show = search_text_matches(keyword, searchable)
             self.lines_table.setRowHidden(row, not show)
             if show:
                 visible += 1
@@ -1713,18 +1788,21 @@ class SalesVoucherWindow(QMainWindow):
             f"{len(self.special_item_codes):,}개 품목을 본사창고(100) 출고 대상으로 지정했습니다.",
         )
 
-    def open_special_items(self) -> None:
+    def open_headquarters_lines(self) -> None:
         if self.current_result is None:
             QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
             return
         lines = [
             line for line in self.current_result.lines
-            if line.item_code in self.special_item_codes
+            if str(line.warehouse) == "100"
         ]
-        dialog = SpecialLinesDialog(
+        dialog = WarehouseLinesDialog(
             lines,
             self.voucher_date.date().toPython(),
             self.manager_code.text().strip() or "00109",
+            "100",
+            "본사창고",
+            True,
             self,
         )
         dialog.exec()
@@ -1741,6 +1819,25 @@ class SalesVoucherWindow(QMainWindow):
                 f"본사출고 품목 {len(dialog.removed_codes):,}개 해제 · 기본창고 복원"
             )
             self.db_status.setStyleSheet("color:#047857;font-weight:600;")
+
+    def open_wekeep_lines(self) -> None:
+        if self.current_result is None:
+            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            return
+        warehouse_code = str(self.default_warehouse.value())
+        lines = [
+            line for line in self.current_result.lines
+            if str(line.warehouse) == warehouse_code
+        ]
+        WarehouseLinesDialog(
+            lines,
+            self.voucher_date.date().toPython(),
+            self.manager_code.text().strip() or "00109",
+            warehouse_code,
+            "위킵창고",
+            False,
+            self,
+        ).exec()
 
     def delete_local_db_items(self) -> None:
         source_catalog = self.base_catalog or self.catalog
@@ -2122,6 +2219,7 @@ class SalesVoucherWindow(QMainWindow):
         )
         self._show_result(self.current_result)
         self.export_button.setEnabled(bool(self.current_result.lines))
+        self.ecount_api_button.setEnabled(bool(self.current_result.lines))
 
     def open_set_mapping_dialog(self, issue_row: int, _column: int = 0) -> None:
         if self.current_result is None or self.catalog is None:
@@ -2348,6 +2446,49 @@ class SalesVoucherWindow(QMainWindow):
             self.analyze()
         except Exception as exc:
             QMessageBox.critical(self, "DB 추가 실패", str(exc))
+
+    def open_ecount_sales_api(self) -> None:
+        if self.current_result is None or not self.current_result.lines:
+            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            return
+        try:
+            self._apply_table_edits()
+        except Exception as exc:
+            QMessageBox.warning(self, "수정값 오류", f"수량·단가·창고 값을 확인해주세요.\n{exc}")
+            return
+        if not self.current_result.is_reconciled:
+            QMessageBox.critical(
+                self,
+                "API 전송 차단",
+                f"금액 차이 {self.current_result.amount_difference:,.0f}원이 있어 이카운트에 전송할 수 없습니다.",
+            )
+            return
+        review_lines = [line for line in self.current_result.lines if line.needs_review]
+        if self.current_result.issues or review_lines:
+            QMessageBox.critical(
+                self,
+                "API 전송 차단",
+                f"확인 필요 항목 {max(len(self.current_result.issues), len(review_lines)):,}건을 먼저 처리해주세요.",
+            )
+            return
+        invalid_lines = [
+            line for line in self.current_result.lines
+            if line.quantity <= 0 or line.unit_price < 0 or not str(line.warehouse).strip()
+        ]
+        if invalid_lines:
+            QMessageBox.critical(
+                self,
+                "API 전송 차단",
+                f"수량·단가·창고 값이 올바르지 않은 전표 행이 {len(invalid_lines):,}개 있습니다.",
+            )
+            return
+        EcountSalesApiDialog(
+            self.current_result.lines,
+            self.voucher_date.date().toPython(),
+            self.current_result.output_total,
+            self.manager_code.text().strip() or "00109",
+            self,
+        ).exec()
 
     def export_excel(self) -> None:
         if self.current_result is None:

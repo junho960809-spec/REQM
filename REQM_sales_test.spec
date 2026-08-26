@@ -23,6 +23,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Codex/Poppler 런타임의 ICU DLL이 Qt6Core보다 먼저 수집되면
+# 배포 PC에서 QtCore가 로드되지 않는다. Qt는 Windows 기본 ICU를 사용한다.
+conflicting_icu_dlls = {'icuuc.dll', 'icudt78.dll'}
+a.binaries = [
+    binary for binary in a.binaries
+    if Path(binary[0]).name.lower() not in conflicting_icu_dlls
+]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
