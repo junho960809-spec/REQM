@@ -611,13 +611,23 @@ def convert_orders(
         )
         main = price_components[0]
         main_quantity = as_decimal(main.get("quantity"), Decimal("1"))
-        main_price = ((order.unit_total - fixed_total) / main_quantity).quantize(MONEY, rounding=ROUND_HALF_UP)
-        if main_price < 0:
-            reason = f"세트 차감 후 본품 단가가 음수입니다: {main_price}"
+        main_total = order.item_total - (fixed_total * order.quantity)
+        if main_total < 0:
+            reason = f"세트 차감 후 본품 금액이 음수입니다: {main_total}"
             issues.append(_issue(order, reason))
             _append_review_line(raw_lines, customer_code, customer_name, order, default_warehouse, reason)
             continue
-        _append_line(raw_lines, catalog, customer_code, customer_name, main, order.quantity * main_quantity, main_price, default_warehouse, order.order_no)
+        _append_exact_total_lines(
+            raw_lines,
+            catalog,
+            customer_code,
+            customer_name,
+            main,
+            order.quantity * main_quantity,
+            main_total,
+            default_warehouse,
+            order.order_no,
+        )
         for component in price_components[1:]:
             component_quantity = as_decimal(component.get("quantity"), Decimal("1"))
             _append_line(

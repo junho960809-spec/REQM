@@ -68,6 +68,33 @@ class SalesCoreTests(unittest.TestCase):
         self.assertEqual(result.input_total, result.output_total)
         self.assertEqual(result.issues, [])
 
+    def test_set_main_amount_is_split_without_one_won_loss(self) -> None:
+        order = SmartStoreOrder(
+            source_row=105,
+            order_no="2026082637104871",
+            product_order_no="PRODUCT-ROUNDING",
+            paid_at=datetime(2026, 8, 26, 10, 0),
+            status="구매확정",
+            product_name="상품 세트",
+            options="옵션 핑크",
+            quantity=Decimal("3"),
+            item_total=Decimal("132700"),
+        )
+        result = convert_orders([order], self.catalog)
+
+        main_lines = sorted(
+            (line.quantity, line.unit_price)
+            for line in result.lines
+            if line.item_code == "MAIN"
+        )
+        self.assertEqual(
+            main_lines,
+            [(Decimal("1"), Decimal("37334.00")), (Decimal("2"), Decimal("37333.00"))],
+        )
+        self.assertEqual(result.output_total, Decimal("132700.00"))
+        self.assertEqual(result.amount_difference, Decimal("0.00"))
+        self.assertTrue(result.is_reconciled)
+
     def test_item_order_details_keep_buyer_and_converted_quantity(self) -> None:
         order = SmartStoreOrder(
             source_row=2,
