@@ -51,6 +51,7 @@ from ecount_sales_core import (
     detect_smartstore_order_period,
     normalize_source,
     read_purchase_confirmed_orders,
+    read_sellmate_orders,
     read_smartstore_orders_range,
     write_ecount_workbook,
     write_ecount_lines_workbook,
@@ -825,6 +826,135 @@ class ItemOrderDetailsDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class SmartStoreSourceDialog(QDialog):
+    def __init__(
+        self,
+        source_path: str,
+        confirmed_path: str,
+        start_date: QDate,
+        end_date: QDate,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("스마트스토어 전표 입력")
+        self.resize(720, 230)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source_path = QLineEdit(source_path)
+        self.source_path.setReadOnly(True)
+        self.confirmed_path = QLineEdit(confirmed_path)
+        self.confirmed_path.setReadOnly(True)
+        self.start_date = QDateEdit(start_date)
+        self.end_date = QDateEdit(end_date)
+        for widget in (self.start_date, self.end_date):
+            widget.setCalendarPopup(True)
+
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.addWidget(self.source_path, 1)
+        source_button = QPushButton("원본 선택")
+        source_button.clicked.connect(self._choose_source)
+        source_layout.addWidget(source_button)
+        form.addRow("스마트스토어 원본", source_row)
+
+        confirmed_row = QWidget()
+        confirmed_layout = QHBoxLayout(confirmed_row)
+        confirmed_layout.setContentsMargins(0, 0, 0, 0)
+        confirmed_layout.addWidget(self.confirmed_path, 1)
+        confirmed_button = QPushButton("구매확정 선택")
+        confirmed_button.clicked.connect(self._choose_confirmed)
+        confirmed_layout.addWidget(confirmed_button)
+        clear_button = QPushButton("해제")
+        clear_button.clicked.connect(self.confirmed_path.clear)
+        confirmed_layout.addWidget(clear_button)
+        form.addRow("구매확정 파일", confirmed_row)
+
+        dates = QWidget()
+        dates_layout = QHBoxLayout(dates)
+        dates_layout.setContentsMargins(0, 0, 0, 0)
+        dates_layout.addWidget(self.start_date)
+        dates_layout.addWidget(QLabel("~"))
+        dates_layout.addWidget(self.end_date)
+        dates_layout.addStretch()
+        form.addRow("주문 기간", dates)
+        layout.addLayout(form)
+        note = QLabel("원본을 선택하면 결제일 기준 주문 기간을 자동으로 확인합니다.")
+        note.setStyleSheet("color:#526D82;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("이 입력 사용")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_source(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "스마트스토어 원본 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)"
+        )
+        if not path:
+            return
+        try:
+            start, end = detect_smartstore_order_period(path)
+        except Exception as exc:
+            QMessageBox.warning(self, "파일 형식 확인", str(exc))
+            return
+        self.source_path.setText(path)
+        self.start_date.setDate(QDate(start.year, start.month, start.day))
+        self.end_date.setDate(QDate(end.year, end.month, end.day))
+
+    def _choose_confirmed(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "스마트스토어 구매확정 파일 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)"
+        )
+        if path:
+            self.confirmed_path.setText(path)
+
+
+class SellmateSourceDialog(QDialog):
+    def __init__(self, source_path: str, voucher_date: QDate, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("폐쇄몰·외부 판매처 전표 입력")
+        self.resize(720, 190)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.source_path = QLineEdit(source_path)
+        self.source_path.setReadOnly(True)
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        source_layout.addWidget(self.source_path, 1)
+        source_button = QPushButton("셀메이트 원본 선택")
+        source_button.clicked.connect(self._choose_source)
+        source_layout.addWidget(source_button)
+        form.addRow("셀메이트 파일", source_row)
+        self.voucher_date = QDateEdit(voucher_date)
+        self.voucher_date.setCalendarPopup(True)
+        form.addRow("전표 일자", self.voucher_date)
+        layout.addLayout(form)
+        note = QLabel("파일의 판매처명을 기준으로 거래처코드를 자동 적용합니다. 주문일 열이 없어 전표 일자는 직접 지정합니다.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#526D82;")
+        layout.addWidget(note)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("이 입력 사용")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_source(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "셀메이트 원본 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)"
+        )
+        if path:
+            try:
+                read_sellmate_orders(path, self.voucher_date.date().toPython())
+            except Exception as exc:
+                QMessageBox.warning(self, "파일 형식 확인", str(exc))
+                return
+            self.source_path.setText(path)
+
+
 class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -840,10 +970,14 @@ class SalesVoucherWindow(QMainWindow):
         self.db_worker: SupabaseConnectWorker | None = None
         self.db_connecting = False
         self.current_result: ConversionResult | None = None
+        self.source_mode = "smartstore"
         self.file_path = QLineEdit()
-        self.file_path.setPlaceholderText("스마트스토어에서 내려받은 원본 Excel을 선택하세요")
+        self.file_path.setPlaceholderText("위의 입력 유형 버튼에서 원본 Excel을 선택하세요")
+        self.file_path.setReadOnly(True)
         self.confirmed_file_path = QLineEdit()
         self.confirmed_file_path.setPlaceholderText("구매확정 Excel을 선택하세요 (선택 사항)")
+        self.confirmed_file_path.setReadOnly(True)
+        self.source_mode_label = QLabel("스마트스토어 입력 대기")
         self.email = QLineEdit()
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.Password)
@@ -925,38 +1059,36 @@ class SalesVoucherWindow(QMainWindow):
         options_layout.setContentsMargins(10, 5, 10, 7)
         options_layout.setHorizontalSpacing(6)
         options_layout.setVerticalSpacing(5)
-        browse_button = QPushButton("원본 선택")
+        browse_button = QPushButton("스마트스토어 전표")
         browse_button.clicked.connect(self.choose_file)
-        confirmed_browse_button = QPushButton("구매확정 선택")
-        confirmed_browse_button.clicked.connect(self.choose_confirmed_file)
+        sellmate_button = QPushButton("폐쇄몰·외부 판매처 전표")
+        sellmate_button.clicked.connect(self.choose_sellmate_file)
         analyze_button = QPushButton("분석 및 자동 매칭")
         analyze_button.setObjectName("primary")
         analyze_button.clicked.connect(self.analyze)
-        options_layout.addWidget(QLabel("원본 파일"), 0, 0)
-        options_layout.addWidget(self.file_path, 0, 1, 1, 9)
-        options_layout.addWidget(browse_button, 0, 10)
-        options_layout.addWidget(QLabel("구매확정 파일"), 1, 0)
-        options_layout.addWidget(self.confirmed_file_path, 1, 1, 1, 9)
-        options_layout.addWidget(confirmed_browse_button, 1, 10)
-        options_layout.addWidget(QLabel("주문 기간"), 2, 0)
-        options_layout.addWidget(self.order_date, 2, 1)
-        options_layout.addWidget(QLabel("~"), 2, 2)
-        options_layout.addWidget(self.order_end_date, 2, 3)
-        options_layout.addWidget(QLabel("전표 일자"), 2, 4)
-        options_layout.addWidget(self.voucher_date, 2, 5)
-        options_layout.addWidget(QLabel("담당자"), 2, 6)
-        options_layout.addWidget(self.manager_code, 2, 7)
-        options_layout.addWidget(QLabel("기본 창고"), 2, 8)
-        options_layout.addWidget(self.default_warehouse, 2, 9)
-        options_layout.addWidget(analyze_button, 2, 10)
+        options_layout.addWidget(QLabel("입력 유형"), 0, 0)
+        options_layout.addWidget(browse_button, 0, 1, 1, 2)
+        options_layout.addWidget(sellmate_button, 0, 3, 1, 3)
+        options_layout.addWidget(self.source_mode_label, 0, 6, 1, 5)
+        options_layout.addWidget(QLabel("선택 파일"), 1, 0)
+        options_layout.addWidget(self.file_path, 1, 1, 1, 10)
+        options_layout.addWidget(QLabel("추가 파일"), 2, 0)
+        options_layout.addWidget(self.confirmed_file_path, 2, 1, 1, 4)
+        options_layout.addWidget(QLabel("전표 일자"), 2, 5)
+        options_layout.addWidget(self.voucher_date, 2, 6)
+        options_layout.addWidget(QLabel("담당자"), 2, 7)
+        options_layout.addWidget(self.manager_code, 2, 8)
+        options_layout.addWidget(QLabel("기본 창고"), 2, 9)
+        options_layout.addWidget(self.default_warehouse, 2, 10)
+        options_layout.addWidget(analyze_button, 3, 1, 1, 10)
         options_layout.setColumnStretch(1, 1)
         options_layout.setColumnStretch(3, 1)
-        options.setMaximumHeight(142)
+        options.setMaximumHeight(172)
         layout.addWidget(options)
 
         cards = QHBoxLayout()
         for label, widget, color in (
-            ("대상 주문행(원본+구매확정)", self.summary_orders, "#1D4ED8"),
+            ("대상 주문행", self.summary_orders, "#1D4ED8"),
             ("전표 품목행", self.summary_lines, "#047857"),
             ("확인 필요", self.summary_issues, "#B45309"),
             ("합산 최초 상품금액", self.summary_initial_total, "#334155"),
@@ -1350,19 +1482,48 @@ class SalesVoucherWindow(QMainWindow):
         self.db_worker = None
 
     def choose_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "스마트스토어 원본 선택", str(Path.home()), "Excel 파일 (*.xlsx *.xlsm)")
-        if path:
-            self.file_path.setText(path)
-            try:
-                start_date, end_date = detect_smartstore_order_period(path)
-                self.order_date.setDate(QDate(start_date.year, start_date.month, start_date.day))
-                self.order_end_date.setDate(QDate(end_date.year, end_date.month, end_date.day))
-                self.db_status.setText(
-                    f"원본 주문 기간 자동 확인: {start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}"
-                )
-                self.db_status.setStyleSheet("color:#1D4ED8;font-weight:600;")
-            except Exception as exc:
-                QMessageBox.warning(self, "주문 기간 확인 실패", str(exc))
+        dialog = SmartStoreSourceDialog(
+            self.file_path.text() if self.source_mode == "smartstore" else "",
+            self.confirmed_file_path.text() if self.source_mode == "smartstore" else "",
+            self.order_date.date(),
+            self.order_end_date.date(),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if not dialog.source_path.text().strip():
+            QMessageBox.information(self, "원본 파일", "스마트스토어 원본 Excel 파일을 선택해주세요.")
+            return
+        self.source_mode = "smartstore"
+        self.file_path.setText(dialog.source_path.text())
+        self.confirmed_file_path.setText(dialog.confirmed_path.text())
+        self.order_date.setDate(dialog.start_date.date())
+        self.order_end_date.setDate(dialog.end_date.date())
+        self.source_mode_label.setText(
+            f"스마트스토어 · {dialog.start_date.date().toString('yyyy-MM-dd')} ~ "
+            f"{dialog.end_date.date().toString('yyyy-MM-dd')}"
+        )
+        self.source_mode_label.setStyleSheet("color:#1D4ED8;font-weight:700;")
+
+    def choose_sellmate_file(self) -> None:
+        dialog = SellmateSourceDialog(
+            self.file_path.text() if self.source_mode == "sellmate" else "",
+            self.voucher_date.date(),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if not dialog.source_path.text().strip():
+            QMessageBox.information(self, "원본 파일", "셀메이트 원본 Excel 파일을 선택해주세요.")
+            return
+        self.source_mode = "sellmate"
+        self.file_path.setText(dialog.source_path.text())
+        self.confirmed_file_path.clear()
+        self.voucher_date.setDate(dialog.voucher_date.date())
+        self.source_mode_label.setText(
+            f"폐쇄몰·외부 판매처 · 전표일 {dialog.voucher_date.date().toString('yyyy-MM-dd')}"
+        )
+        self.source_mode_label.setStyleSheet("color:#7C3AED;font-weight:700;")
 
     def choose_confirmed_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1380,7 +1541,7 @@ class SalesVoucherWindow(QMainWindow):
             return
         source = Path(self.file_path.text().strip())
         if not source.exists():
-            QMessageBox.information(self, "원본 파일", "스마트스토어 원본 Excel 파일을 선택해주세요.")
+            QMessageBox.information(self, "원본 파일", "입력 유형 버튼에서 원본 Excel 파일을 선택해주세요.")
             return
         start_date = self.order_date.date().toPython()
         end_date = self.order_end_date.date().toPython()
@@ -1389,16 +1550,25 @@ class SalesVoucherWindow(QMainWindow):
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            original_orders = read_smartstore_orders_range(source, start_date, end_date)
+            if self.source_mode == "sellmate":
+                original_orders = read_sellmate_orders(source, self.voucher_date.date().toPython())
+            else:
+                original_orders = read_smartstore_orders_range(source, start_date, end_date)
             if not original_orders:
                 QMessageBox.information(
                     self,
                     "대상 없음",
-                    f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d} 결제 주문을 찾지 못했습니다.",
+                    "셀메이트 주문을 찾지 못했습니다."
+                    if self.source_mode == "sellmate"
+                    else f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d} 결제 주문을 찾지 못했습니다.",
                 )
                 return
             confirmed_orders = []
-            confirmed_path_text = self.confirmed_file_path.text().strip()
+            confirmed_path_text = (
+                self.confirmed_file_path.text().strip()
+                if self.source_mode == "smartstore"
+                else ""
+            )
             if confirmed_path_text:
                 confirmed_source = Path(confirmed_path_text)
                 if not confirmed_source.exists():
@@ -1790,7 +1960,7 @@ class SalesVoucherWindow(QMainWindow):
 
     def open_headquarters_lines(self) -> None:
         if self.current_result is None:
-            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            QMessageBox.information(self, "분석 필요", "판매처 원본 파일을 먼저 분석해주세요.")
             return
         lines = [
             line for line in self.current_result.lines
@@ -1822,7 +1992,7 @@ class SalesVoucherWindow(QMainWindow):
 
     def open_wekeep_lines(self) -> None:
         if self.current_result is None:
-            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            QMessageBox.information(self, "분석 필요", "판매처 원본 파일을 먼저 분석해주세요.")
             return
         warehouse_code = str(self.default_warehouse.value())
         lines = [
@@ -2245,7 +2415,7 @@ class SalesVoucherWindow(QMainWindow):
         if order is None:
             return
         existing_mapping = self.catalog.mappings.get(
-            ("리큐엠_스마트스토어", order.normalized_source),
+            (order.source_channel, order.normalized_source),
             {},
         )
         dialog = SetMappingDialog(
@@ -2264,11 +2434,11 @@ class SalesVoucherWindow(QMainWindow):
         mapping_key = str(existing_mapping.get("mapping_key") or "")
         if not mapping_key:
             mapping_key = hashlib.sha256(
-                f"리큐엠_스마트스토어|{order.normalized_source}".encode("utf-8")
+                f"{order.source_channel}|{order.normalized_source}".encode("utf-8")
             ).hexdigest()
         price_rule_key = hashlib.sha256(
             (
-                f"리큐엠_스마트스토어|{order.normalized_source}|"
+                f"{order.source_channel}|{order.normalized_source}|"
                 f"{order.unit_total:.2f}"
             ).encode("utf-8")
         ).hexdigest()
@@ -2278,7 +2448,7 @@ class SalesVoucherWindow(QMainWindow):
             self.supabase_client.table("ecount_product_mappings").upsert(
                 {
                     "mapping_key": mapping_key,
-                    "source_channel": "리큐엠_스마트스토어",
+                    "source_channel": order.source_channel,
                     "source_product_text": source_text,
                     "normalized_source": order.normalized_source,
                     "mapping_type": "set",
@@ -2308,7 +2478,7 @@ class SalesVoucherWindow(QMainWindow):
             self.supabase_client.table("ecount_price_rules").upsert(
                 {
                     "price_rule_key": price_rule_key,
-                    "source_channel": "리큐엠_스마트스토어",
+                    "source_channel": order.source_channel,
                     "source_product_name": order.product_name,
                     "source_options": order.options,
                     "normalized_source": order.normalized_source,
@@ -2406,7 +2576,7 @@ class SalesVoucherWindow(QMainWindow):
             return
         source_text = f"{order.product_name}{order.options}"
         mapping_key = hashlib.sha256(
-            f"리큐엠_스마트스토어|{order.normalized_source}".encode("utf-8")
+            f"{order.source_channel}|{order.normalized_source}".encode("utf-8")
         ).hexdigest()
         answer = QMessageBox.question(
             self,
@@ -2421,7 +2591,7 @@ class SalesVoucherWindow(QMainWindow):
             self.supabase_client.table("ecount_product_mappings").upsert(
                 {
                     "mapping_key": mapping_key,
-                    "source_channel": "리큐엠_스마트스토어",
+                    "source_channel": order.source_channel,
                     "source_product_text": source_text,
                     "normalized_source": order.normalized_source,
                     "mapping_type": "single",
@@ -2449,7 +2619,7 @@ class SalesVoucherWindow(QMainWindow):
 
     def open_ecount_sales_api(self) -> None:
         if self.current_result is None or not self.current_result.lines:
-            QMessageBox.information(self, "분석 필요", "원본·구매확정 파일을 먼저 분석해주세요.")
+            QMessageBox.information(self, "분석 필요", "판매처 원본 파일을 먼저 분석해주세요.")
             return
         try:
             self._apply_table_edits()
@@ -2506,10 +2676,14 @@ class SalesVoucherWindow(QMainWindow):
                 "금액 차이가 0원이 아니면 저장할 수 없습니다.",
             )
             return
-        start_day = self.order_date.date().toString("yyyyMMdd")
-        end_day = self.order_end_date.date().toString("yyyyMMdd")
-        period = start_day if start_day == end_day else f"{start_day}~{end_day}"
-        suggested = Path(self.file_path.text()).with_name(f"네이버_이카운트_판매전표_{period}.xlsx")
+        if self.source_mode == "sellmate":
+            period = self.voucher_date.date().toString("yyyyMMdd")
+        else:
+            start_day = self.order_date.date().toString("yyyyMMdd")
+            end_day = self.order_end_date.date().toString("yyyyMMdd")
+            period = start_day if start_day == end_day else f"{start_day}~{end_day}"
+        prefix = "셀메이트" if self.source_mode == "sellmate" else "네이버"
+        suggested = Path(self.file_path.text()).with_name(f"{prefix}_이카운트_판매전표_{period}.xlsx")
         path, _ = QFileDialog.getSaveFileName(self, "이카운트 Excel 저장", str(suggested), "Excel 파일 (*.xlsx)")
         if not path:
             return

@@ -79,6 +79,7 @@ class SmartStoreOrder:
     source_type: str = "원본"
     include_shipping: bool = True
     purchaser_name: str = ""
+    source_channel: str = CHANNEL_NAME
 
     @property
     def normalized_source(self) -> str:
@@ -145,6 +146,7 @@ class ShippingCharge:
     extra_shipping: Decimal
     shipping_discount: Decimal
     effective_amount: Decimal
+    source_channel: str = CHANNEL_NAME
 
     @property
     def is_adjusted(self) -> bool:
@@ -548,24 +550,120 @@ def combine_order_sources(
     return [*original_orders, *confirmed_orders]
 
 
+def read_sellmate_orders(
+    path: str | Path,
+    voucher_date: date,
+) -> list[SmartStoreOrder]:
+    """셀메이트 이카운트양식 파일을 판매전표 공통 주문 구조로 읽는다."""
+    workbook = load_workbook(path, read_only=True, data_only=True)
+    try:
+        worksheet = workbook.worksheets[0]
+        rows = worksheet.iter_rows(values_only=True)
+        header: list[str] | None = None
+        header_row = 0
+        required = {
+            "판매처명",
+            "수량",
+            "옵션판매단가",
+            "금액",
+            "판매처주문번호",
+            "옵션상품명",
+            "상품옵션",
+        }
+        for row_number, row in enumerate(rows, start=1):
+            names = [str(value or "").strip() for value in row]
+            if required.issubset(set(names)):
+                header = names
+                header_row = row_number
+                break
+            if row_number >= 30:
+                break
+        if header is None:
+            raise ValueError(
+                "셀메이트 헤더(판매처명/수량/옵션판매단가/금액/판매처주문번호/"
+                "옵션상품명/상품옵션)를 찾지 못했습니다."
+            )
+        indexes = {name: index for index, name in enumerate(header)}
+        paid_at = datetime.combine(voucher_date, datetime.min.time())
+        result: list[SmartStoreOrder] = []
+        for source_row, row in enumerate(rows, start=header_row + 1):
+            if not any(value not in (None, "") for value in row):
+                continue
+            channel = str(row[indexes["판매처명"]] or "").strip()
+            order_no = clean_identifier(row[indexes["판매처주문번호"]])
+            quantity = as_decimal(row[indexes["수량"]])
+            if not channel or not order_no or quantity <= 0:
+                continue
+            amount = as_decimal(row[indexes["금액"]])
+            option_total = as_decimal(row[indexes["옵션판매단가"]]) * quantity
+            custom_shipping = (
+                as_decimal(row[indexes["사용자정의10"]])
+                if "사용자정의10" in indexes
+                else Decimal("0")
+            )
+            shipping_total = custom_shipping if custom_shipping > 0 else Decimal("0")
+            item_total = amount
+            if normalize_source(channel) == normalize_source("11번가"):
+                embedded_shipping = amount - option_total
+                if embedded_shipping > 0:
+                    shipping_total = embedded_shipping
+                    item_total = option_total
+            result.append(
+                SmartStoreOrder(
+                    source_row=source_row,
+                    order_no=order_no,
+                    product_order_no=f"{channel}|{order_no}|{source_row}",
+                    paid_at=paid_at,
+                    status="",
+                    product_name=str(row[indexes["옵션상품명"]] or "").strip(),
+                    options=str(row[indexes["상품옵션"]] or "").strip(),
+                    quantity=quantity,
+                    item_total=item_total,
+                    shipping_bundle_no=f"{channel}|{order_no}" if shipping_total > 0 else "",
+                    shipping_total=shipping_total,
+                    initial_item_total=item_total,
+                    final_item_total=item_total,
+                    source_type="셀메이트",
+                    include_shipping=True,
+                    purchaser_name=(
+                        str(row[indexes["수령자"]] or "").strip()
+                        if "수령자" in indexes
+                        else ""
+                    ),
+                    source_channel=channel,
+                )
+            )
+        if not result:
+            raise ValueError("셀메이트 파일에서 유효한 주문행을 찾지 못했습니다.")
+        return result
+    finally:
+        workbook.close()
+
+
 def convert_orders(
     orders: list[SmartStoreOrder],
     catalog: ReferenceCatalog,
     channel_name: str = CHANNEL_NAME,
     default_warehouse: str = "300",
 ) -> ConversionResult:
-    channel = catalog.channels.get(channel_name, {})
-    customer_code = str(channel.get("ecount_customer_code") or "AC008712")
-    customer_name = str(channel.get("ecount_customer_name") or "샵N")
     raw_lines: list[VoucherLine] = []
     issues: list[ReviewIssue] = []
     shipping_charges = _collect_shipping_charges(orders, issues)
 
     for order in orders:
+        order_channel = order.source_channel or channel_name
+        channel = catalog.channels.get(order_channel, {})
+        customer_code = str(channel.get("ecount_customer_code") or "")
+        customer_name = str(channel.get("ecount_customer_name") or "")
+        if not customer_code:
+            reason = f"판매처 거래처코드가 DB에 없습니다: {order_channel}"
+            issues.append(_issue(order, reason))
+            _append_review_line(raw_lines, "", customer_name, order, default_warehouse, reason)
+            continue
         if any(word in order.status for word in ("취소", "반품", "교환")):
             issues.append(_issue(order, f"주문상태 확인 필요: {order.status}"))
             continue
-        mapping = catalog.mappings.get((channel_name, order.normalized_source))
+        mapping = catalog.mappings.get((order_channel, order.normalized_source))
         if not mapping:
             reason = "상품/옵션 조합이 DB에 없습니다."
             issues.append(_issue(order, reason))
@@ -592,7 +690,7 @@ def convert_orders(
             )
             continue
 
-        templates = catalog.price_templates.get((channel_name, order.normalized_source), [])
+        templates = catalog.price_templates.get((order_channel, order.normalized_source), [])
         if not templates:
             reason = "세트 가격 배분 기준이 DB에 없습니다."
             issues.append(_issue(order, reason))
@@ -649,13 +747,17 @@ def convert_orders(
         or shipping_item.get("standard_name")
         or "배송비"
     )
-    shipping_counts: dict[Decimal, int] = defaultdict(int)
-    shipping_orders: dict[Decimal, list[str]] = defaultdict(list)
+    shipping_counts: dict[tuple[str, str, Decimal], int] = defaultdict(int)
+    shipping_orders: dict[tuple[str, str, Decimal], list[str]] = defaultdict(list)
     for charge in shipping_charges:
         if charge.effective_amount > 0:
-            shipping_counts[charge.effective_amount] += 1
-            shipping_orders[charge.effective_amount].append(charge.order_no)
-    for unit_price, count in shipping_counts.items():
+            channel = catalog.channels.get(charge.source_channel, {})
+            customer_code = str(channel.get("ecount_customer_code") or "")
+            customer_name = str(channel.get("ecount_customer_name") or "")
+            key = (customer_code, customer_name, charge.effective_amount)
+            shipping_counts[key] += 1
+            shipping_orders[key].append(charge.order_no)
+    for (customer_code, customer_name, unit_price), count in shipping_counts.items():
         raw_lines.append(
             VoucherLine(
                 customer_code=customer_code,
@@ -666,7 +768,7 @@ def convert_orders(
                 unit_price=unit_price,
                 warehouse=default_warehouse,
                 source_count=count,
-                source_orders=shipping_orders[unit_price],
+                source_orders=shipping_orders[(customer_code, customer_name, unit_price)],
                 is_shipping=True,
             )
         )
@@ -735,16 +837,16 @@ def _collect_shipping_charges(
     orders: list[SmartStoreOrder],
     issues: list[ReviewIssue],
 ) -> list[ShippingCharge]:
-    grouped: dict[str, list[SmartStoreOrder]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[SmartStoreOrder]] = defaultdict(list)
     for order in orders:
         if not order.include_shipping:
             continue
-        key = order.shipping_bundle_no or order.order_no
-        if key:
-            grouped[key].append(order)
+        bundle_key = order.shipping_bundle_no or order.order_no
+        if bundle_key:
+            grouped[(order.source_channel, bundle_key)].append(order)
 
     charges: list[ShippingCharge] = []
-    for key, group in grouped.items():
+    for (source_channel, key), group in grouped.items():
         signatures = {
             (order.shipping_total, order.extra_shipping, order.shipping_discount)
             for order in group
@@ -769,6 +871,7 @@ def _collect_shipping_charges(
                 extra_shipping=extra_shipping,
                 shipping_discount=shipping_discount,
                 effective_amount=effective,
+                source_channel=source_channel,
             )
         )
     return charges

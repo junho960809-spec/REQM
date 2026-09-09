@@ -23,6 +23,13 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# 번들 런타임의 ICU DLL이 Qt6Core보다 먼저 로드되면 일부 배포 PC에서
+# 프로그램이 시작되지 않으므로 Qt 충돌 DLL을 배포 목록에서 제외한다.
+conflicting_icu_dlls = {"icuuc.dll", "icudt78.dll"}
+a.binaries = [
+    binary for binary in a.binaries
+    if Path(binary[0]).name.lower() not in conflicting_icu_dlls
+]
 pyz = PYZ(a.pure)
 exe = EXE(
     pyz,

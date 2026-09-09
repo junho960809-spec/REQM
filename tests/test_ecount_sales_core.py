@@ -16,6 +16,7 @@ from ecount_sales_core import (
     convert_orders,
     detect_smartstore_order_period,
     read_purchase_confirmed_orders,
+    read_sellmate_orders,
     read_smartstore_orders,
     read_smartstore_orders_range,
     write_ecount_workbook,
@@ -402,6 +403,73 @@ class SalesCoreTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "금액 이중계상"):
             combine_order_sources([original], [confirmed])
+
+    def test_sellmate_reader_separates_11st_embedded_shipping(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "sellmate.xlsx"
+            from openpyxl import Workbook
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "판매처명", "수량", "옵션판매단가", "금액", "판매처주문번호", "수령자",
+                "옵션상품명", "상품옵션", "사용자정의10", "재고매칭(1)옵션내용",
+            ])
+            sheet.append([
+                "11번가", 1, 36900, 39900, "ORDER-11ST", "홍길동",
+                "QP2000C", "색상:베이지", None, "QP2000C 베이지",
+            ])
+            sheet.append([
+                "오늘의집", 1, 30900, 32900, "ORDER-OHOUSE", "김하늘",
+                "T3100", "베이지", 3000, "T3100 - 베이지",
+            ])
+            workbook.save(source)
+            workbook.close()
+
+            orders = read_sellmate_orders(source, date(2026, 9, 8))
+
+            self.assertEqual(len(orders), 2)
+            self.assertEqual(orders[0].source_channel, "11번가")
+            self.assertEqual(orders[0].item_total, Decimal("36900.00"))
+            self.assertEqual(orders[0].shipping_total, Decimal("3000.00"))
+            self.assertEqual(orders[1].item_total, Decimal("32900.00"))
+            self.assertEqual(orders[1].shipping_total, Decimal("3000.00"))
+            self.assertEqual(orders[1].paid_at.date(), date(2026, 9, 8))
+
+    def test_conversion_uses_each_sellmate_channel_customer(self) -> None:
+        catalog = ReferenceCatalog(
+            items=[
+                {"item_code": "ITEM-A", "representative_name": "품목A"},
+                {"item_code": "ITEM-B", "representative_name": "품목B"},
+                {"item_code": "택배운송비", "representative_name": "배송비"},
+            ],
+            channels=[
+                {"source_name": "11번가", "ecount_customer_code": "C-11", "is_active": True},
+                {"source_name": "오늘의집", "ecount_customer_code": "C-OH", "is_active": True},
+            ],
+            mappings=[
+                {"mapping_key": "M-A", "source_channel": "11번가", "normalized_source": "상품a옵션", "mapping_type": "single", "is_active": True},
+                {"mapping_key": "M-B", "source_channel": "오늘의집", "normalized_source": "상품b옵션", "mapping_type": "single", "is_active": True},
+            ],
+            mapping_components=[
+                {"mapping_key": "M-A", "sequence": 1, "item_code": "ITEM-A", "quantity": 1},
+                {"mapping_key": "M-B", "sequence": 1, "item_code": "ITEM-B", "quantity": 1},
+            ],
+            price_rules=[],
+            price_components=[],
+        )
+        orders = [
+            SmartStoreOrder(2, "O-A", "P-A", datetime(2026, 9, 8), "", "상품A", "옵션", Decimal("1"), Decimal("36900"), shipping_bundle_no="S-A", shipping_total=Decimal("3000"), source_type="셀메이트", source_channel="11번가"),
+            SmartStoreOrder(3, "O-B", "P-B", datetime(2026, 9, 8), "", "상품B", "옵션", Decimal("1"), Decimal("32900"), shipping_bundle_no="S-B", shipping_total=Decimal("3000"), source_type="셀메이트", source_channel="오늘의집"),
+        ]
+
+        result = convert_orders(orders, catalog)
+
+        self.assertEqual({line.customer_code for line in result.lines}, {"C-11", "C-OH"})
+        shipping = [line for line in result.lines if line.is_shipping]
+        self.assertEqual(len(shipping), 2)
+        self.assertEqual(result.output_total, Decimal("75800.00"))
+        self.assertTrue(result.is_reconciled)
 
 
 if __name__ == "__main__":
