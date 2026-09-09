@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import sys
+from PyInstaller.utils.hooks import collect_data_files
 
 python_runtime_dir = Path(sys.base_prefix)
 runtime_binaries = [
@@ -14,7 +15,7 @@ a = Analysis(
     ["ecount_sales_app.py"],
     pathex=[],
     binaries=runtime_binaries,
-    datas=[("supabase/ecount_migration/data", "supabase/ecount_migration/data")],
+    datas=[("supabase/ecount_migration/data", "supabase/ecount_migration/data")] + collect_data_files("playwright"),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -37,7 +38,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="REQM_판매전표",
+    name="REQM_판매전표_ESM",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

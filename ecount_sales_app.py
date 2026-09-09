@@ -57,6 +57,7 @@ from ecount_sales_core import (
     write_ecount_lines_workbook,
 )
 from ecount_sales_api_dialog import EcountSalesApiDialog
+from esm_dialog import EsmSourceDialog
 
 
 SOURCE_DIR = Path(__file__).resolve().parent
@@ -1052,7 +1053,8 @@ class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         write_db_log("프로그램 시작")
-        self.setWindowTitle("REQM 판매전표 반자동화 - DB 로그인 수정본")
+        self.setWindowTitle("REQM 판매전표 반자동화 - ESM 주문 취합")
+        self.esm_session = None
         self.resize(1280, 760)
         self.catalog: ReferenceCatalog | None = None
         self.base_catalog: ReferenceCatalog | None = None
@@ -1156,13 +1158,16 @@ class SalesVoucherWindow(QMainWindow):
         browse_button.clicked.connect(self.choose_file)
         sellmate_button = QPushButton("폐쇄몰·외부 판매처 전표")
         sellmate_button.clicked.connect(self.choose_sellmate_file)
+        esm_button = QPushButton("ESM 주문 수집")
+        esm_button.clicked.connect(self.choose_esm_orders)
         analyze_button = QPushButton("분석 및 자동 매칭")
         analyze_button.setObjectName("primary")
         analyze_button.clicked.connect(self.analyze)
         options_layout.addWidget(QLabel("입력 유형"), 0, 0)
         options_layout.addWidget(browse_button, 0, 1, 1, 2)
         options_layout.addWidget(sellmate_button, 0, 3, 1, 3)
-        options_layout.addWidget(self.source_mode_label, 0, 6, 1, 5)
+        options_layout.addWidget(esm_button, 0, 6, 1, 2)
+        options_layout.addWidget(self.source_mode_label, 0, 8, 1, 3)
         options_layout.addWidget(QLabel("선택 파일"), 1, 0)
         options_layout.addWidget(self.file_path, 1, 1, 1, 10)
         options_layout.addWidget(QLabel("추가 파일"), 2, 0)
@@ -1624,6 +1629,20 @@ class SalesVoucherWindow(QMainWindow):
         )
         self.source_mode_label.setStyleSheet("color:#7C3AED;font-weight:700;")
 
+    def choose_esm_orders(self) -> None:
+        dialog = EsmSourceDialog(self.order_date.date(), self.order_end_date.date(), self, self.esm_session)
+        accepted = dialog.exec() == QDialog.Accepted
+        if dialog.session:
+            self.esm_session = dialog.session
+        if not accepted:
+            return
+        self.source_mode = "esm"
+        self.file_path.setText(str(self.esm_session.folder / "수집기록.json"))
+        self.confirmed_file_path.clear()
+        self.source_mode_label.setText(f"ESM · {self.esm_session.manifest['order_count']:,}행")
+        self.source_mode_label.setStyleSheet("color:#1D4ED8;font-weight:700;")
+        self.analyze()
+
     def choose_confirmed_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -1649,7 +1668,14 @@ class SalesVoucherWindow(QMainWindow):
             return
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            if self.source_mode == "sellmate":
+            if self.source_mode == "esm":
+                from esm_orders import EsmSession
+                session = EsmSession.open(source.parent)
+                if session.manifest["state"] != "완료":
+                    raise ValueError("ESM 수집이 완료되지 않았습니다.")
+                esm_rows, _ = session.orders()
+                original_orders = [row.voucher_order(self.voucher_date.date().toPython()) for row in esm_rows]
+            elif self.source_mode == "sellmate":
                 original_orders = read_sellmate_orders(source, self.voucher_date.date().toPython())
             else:
                 original_orders = read_smartstore_orders_range(source, start_date, end_date)
@@ -2894,6 +2920,20 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = SalesVoucherWindow()
+    if len(sys.argv) == 3 and sys.argv[1] == "--esm-self-check":
+        # 배포 EXE 안의 Qt와 Playwright 드라이버를 네트워크 연결 없이 점검한다.
+        from playwright.sync_api import sync_playwright
+        from esm_orders import STATUSES
+        dialog = EsmSourceDialog(QDate.currentDate(), QDate.currentDate(), window)
+        with sync_playwright() as browser_runtime:
+            driver = browser_runtime.chromium.name
+        Path(sys.argv[2]).write_text(json.dumps({
+            "ok": True, "columns": dialog.table.columnCount(), "statuses": len(STATUSES),
+            "browser_driver": driver, "frozen": bool(getattr(sys, "frozen", False)),
+        }), encoding="utf-8")
+        dialog.close()
+        window.close()
+        return 0
     window.show()
     return app.exec()
 

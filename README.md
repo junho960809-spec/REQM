@@ -1,5 +1,11 @@
 # REQM 출고 관리 프로그램 1.0.4
 
+## 판매전표 ESM 주문 수집 추가판
+
+`agent/ecount-transfer-integrated-1.0.5`의 `c3a1e3a`에서 ESM 주문 수집 기능을 추가했습니다.
+판매전표 앱 실행은 `python ecount_sales_app.py`, 배포 빌드는 `pyinstaller --noconfirm --clean REQM_sales_release.spec`입니다.
+사용 방법과 원본 보관 방식은 [ESM 사용 안내](ESM_GUIDE.md)를 확인하세요.
+
 셀메이트·면세점 주문 파일을 자동 판별하고, Supabase 품목 DB와 대조하여 택배 출고용 엑셀을 생성하는 Windows 설치형 프로그램입니다.
 
 ## 주요 기능

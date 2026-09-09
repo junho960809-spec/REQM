@@ -17,6 +17,8 @@ dist/
 *.exe
 *.pkg
 *.pyz
+db_connection.log
+ESM/
 
 # Editor and operating-system files
 .idea/
