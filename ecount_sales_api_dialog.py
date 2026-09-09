@@ -124,15 +124,18 @@ class EcountSalesApiDialog(QDialog):
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet("font-weight:700;color:#0F766E;padding:8px;")
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
-            ["전표묶음", "창고", "거래처코드", "품목코드", "수량", "단가", "금액"]
+            ["전표묶음", "창고", "판매처명", "거래처코드", "품목코드", "품목명", "수량", "단가", "금액"]
         )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        for column in range(4, 7):
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Interactive)
+        self.table.setColumnWidth(5, 230)
+        for column in range(6, 9):
             self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self._fill_preview()
 
@@ -172,22 +175,34 @@ class EcountSalesApiDialog(QDialog):
         self.close_button.clicked.connect(self.reject)
 
     def _fill_preview(self) -> None:
-        serials = {warehouse: index for index, warehouse in enumerate(sorted({str(row.warehouse) for row in self.lines}), 1)}
-        ordered = sorted(self.lines, key=lambda row: (str(row.warehouse), row.item_code, row.unit_price))
+        serials = {
+            key: index
+            for index, key in enumerate(sorted({
+                (str(row.warehouse), str(row.customer_code)) for row in self.lines
+            }), 1)
+        }
+        ordered = sorted(
+            self.lines,
+            key=lambda row: (str(row.warehouse), str(row.customer_code), row.item_code, row.unit_price),
+        )
         self.table.setRowCount(len(ordered))
         for row_index, line in enumerate(ordered):
             values = [
-                serials[str(line.warehouse)],
+                serials[(str(line.warehouse), str(line.customer_code))],
                 line.warehouse,
+                line.source_channel,
                 line.customer_code,
                 line.item_code,
+                line.item_name,
                 f"{line.quantity:f}",
                 f"{line.unit_price:,.0f}",
                 f"{line.total:,.0f}",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
-                if column >= 4:
+                if column == 5:
+                    item.setToolTip(line.item_name)
+                if column >= 6:
                     item.setTextAlignment(2 | 128)
                 self.table.setItem(row_index, column, item)
 
@@ -269,7 +284,11 @@ class EcountSalesApiDialog(QDialog):
                 f"{api_total:,.0f}원이 일치하지 않아 전송을 차단했습니다.",
             )
             return False
-        self.status.setText(f"검증 완료 · API 요청 총액 {api_total:,.0f}원 · 창고별 전표 2개 이하")
+        voucher_count = len({(str(line.warehouse), str(line.customer_code)) for line in self.lines})
+        self.status.setText(
+            f"검증 완료 · API 요청 총액 {api_total:,.0f}원 · "
+            f"창고+거래처별 예상 전표 {voucher_count:,}개"
+        )
         return True
 
     def _set_running(self, running: bool) -> None:

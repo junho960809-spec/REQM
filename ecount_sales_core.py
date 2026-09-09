@@ -106,6 +106,7 @@ class VoucherLine:
     is_shipping: bool = False
     needs_review: bool = False
     review_reason: str = ""
+    source_channel: str = CHANNEL_NAME
 
     @property
     def total(self) -> Decimal:
@@ -121,6 +122,8 @@ class ItemOrderDetail:
     options: str
     order_quantity: Decimal
     converted_quantity: Decimal
+    unit_price: Decimal
+    total: Decimal
     warehouse: str
     source_type: str
 
@@ -159,6 +162,7 @@ class ConversionResult:
     lines: list[VoucherLine]
     issues: list[ReviewIssue]
     shipping_charges: list[ShippingCharge] = field(default_factory=list)
+    manual_expected_total: Decimal | None = None
 
     @property
     def input_total(self) -> Decimal:
@@ -218,7 +222,19 @@ class ConversionResult:
 
     @property
     def expected_output_total(self) -> Decimal:
+        if self.manual_expected_total is not None:
+            return self.manual_expected_total
         return self.input_total + self.shipping_total
+
+    @property
+    def source_expected_output_total(self) -> Decimal:
+        return self.input_total + self.shipping_total
+
+    @property
+    def manual_adjustment_total(self) -> Decimal:
+        if self.manual_expected_total is None:
+            return Decimal("0")
+        return self.manual_expected_total - self.source_expected_output_total
 
     @property
     def amount_difference(self) -> Decimal:
@@ -603,11 +619,25 @@ def read_sellmate_orders(
             )
             shipping_total = custom_shipping if custom_shipping > 0 else Decimal("0")
             item_total = amount
-            if normalize_source(channel) == normalize_source("11번가"):
+            normalized_channel = normalize_source(channel)
+            if normalized_channel in {
+                normalize_source("삼성카드 복지몰"),
+                normalize_source("삼성카드 쇼핑몰"),
+            } and quantity >= 2:
+                item_total = option_total
+            if normalized_channel == normalize_source("11번가"):
                 embedded_shipping = amount - option_total
                 if embedded_shipping > 0:
                     shipping_total = embedded_shipping
                     item_total = option_total
+            elif normalized_channel == normalize_source("오늘의집") and shipping_total > 0:
+                item_total = amount - shipping_total
+                if item_total < 0:
+                    raise ValueError(
+                        f"셀메이트 파일 {source_row}행의 오늘의집 상품금액보다 배송비가 큽니다."
+                    )
+                # 오늘의집 배송비는 별도 전표행을 만들지 않고 상품(세트는 본품) 금액에서 차감한다.
+                shipping_total = Decimal("0")
             result.append(
                 SmartStoreOrder(
                     source_row=source_row,
@@ -687,6 +717,7 @@ def convert_orders(
                 order.item_total,
                 default_warehouse,
                 order.order_no,
+                order_channel,
             )
             continue
 
@@ -725,6 +756,7 @@ def convert_orders(
             main_total,
             default_warehouse,
             order.order_no,
+            order_channel,
         )
         for component in price_components[1:]:
             component_quantity = as_decimal(component.get("quantity"), Decimal("1"))
@@ -738,6 +770,7 @@ def convert_orders(
                 as_decimal(component.get("allocated_unit_price")),
                 default_warehouse,
                 order.order_no,
+                order_channel,
             )
 
     shipping_item = catalog.items.get("택배운송비", {})
@@ -747,17 +780,17 @@ def convert_orders(
         or shipping_item.get("standard_name")
         or "배송비"
     )
-    shipping_counts: dict[tuple[str, str, Decimal], int] = defaultdict(int)
-    shipping_orders: dict[tuple[str, str, Decimal], list[str]] = defaultdict(list)
+    shipping_counts: dict[tuple[str, str, str, Decimal], int] = defaultdict(int)
+    shipping_orders: dict[tuple[str, str, str, Decimal], list[str]] = defaultdict(list)
     for charge in shipping_charges:
         if charge.effective_amount > 0:
             channel = catalog.channels.get(charge.source_channel, {})
             customer_code = str(channel.get("ecount_customer_code") or "")
             customer_name = str(channel.get("ecount_customer_name") or "")
-            key = (customer_code, customer_name, charge.effective_amount)
+            key = (charge.source_channel, customer_code, customer_name, charge.effective_amount)
             shipping_counts[key] += 1
             shipping_orders[key].append(charge.order_no)
-    for (customer_code, customer_name, unit_price), count in shipping_counts.items():
+    for (source_channel, customer_code, customer_name, unit_price), count in shipping_counts.items():
         raw_lines.append(
             VoucherLine(
                 customer_code=customer_code,
@@ -768,8 +801,9 @@ def convert_orders(
                 unit_price=unit_price,
                 warehouse=default_warehouse,
                 source_count=count,
-                source_orders=shipping_orders[(customer_code, customer_name, unit_price)],
+                source_orders=shipping_orders[(source_channel, customer_code, customer_name, unit_price)],
                 is_shipping=True,
+                source_channel=source_channel,
             )
         )
 
@@ -777,6 +811,7 @@ def convert_orders(
     for line in raw_lines:
         key = (
             line.customer_code,
+            line.source_channel,
             line.item_code,
             line.item_name if line.needs_review else "",
             line.warehouse,
@@ -826,6 +861,8 @@ def build_item_order_details(
                     options=order.options,
                     order_quantity=order.quantity,
                     converted_quantity=line.quantity,
+                    unit_price=line.unit_price,
+                    total=line.total,
                     warehouse=line.warehouse,
                     source_type=order.source_type,
                 )
@@ -887,6 +924,7 @@ def _append_line(
     unit_price: Decimal,
     default_warehouse: str,
     order_no: str,
+    source_channel: str,
 ) -> None:
     item_code = str(component.get("item_code") or "")
     item = catalog.items.get(item_code, {})
@@ -902,6 +940,7 @@ def _append_line(
             unit_price=unit_price.quantize(MONEY, rounding=ROUND_HALF_UP),
             warehouse=warehouse,
             source_orders=[order_no],
+            source_channel=source_channel,
         )
     )
 
@@ -916,6 +955,7 @@ def _append_exact_total_lines(
     total: Decimal,
     default_warehouse: str,
     order_no: str,
+    source_channel: str,
 ) -> None:
     if (
         quantity > 0
@@ -928,18 +968,18 @@ def _append_exact_total_lines(
         if base_price_quantity > 0:
             _append_line(
                 target, catalog, customer_code, customer_name, component,
-                base_price_quantity, base_price, default_warehouse, order_no,
+                base_price_quantity, base_price, default_warehouse, order_no, source_channel,
             )
         if higher_price_quantity > 0:
             _append_line(
                 target, catalog, customer_code, customer_name, component,
-                higher_price_quantity, base_price + 1, default_warehouse, order_no,
+                higher_price_quantity, base_price + 1, default_warehouse, order_no, source_channel,
             )
         return
     _append_line(
         target, catalog, customer_code, customer_name, component,
         quantity, (total / quantity).quantize(MONEY, rounding=ROUND_HALF_UP),
-        default_warehouse, order_no,
+        default_warehouse, order_no, source_channel,
     )
 
 
@@ -980,6 +1020,7 @@ def _append_review_line(
                 source_orders=[order.order_no],
                 needs_review=True,
                 review_reason=reason,
+                source_channel=order.source_channel,
             )
         )
 

@@ -432,9 +432,61 @@ class SalesCoreTests(unittest.TestCase):
             self.assertEqual(orders[0].source_channel, "11번가")
             self.assertEqual(orders[0].item_total, Decimal("36900.00"))
             self.assertEqual(orders[0].shipping_total, Decimal("3000.00"))
-            self.assertEqual(orders[1].item_total, Decimal("32900.00"))
-            self.assertEqual(orders[1].shipping_total, Decimal("3000.00"))
+            self.assertEqual(orders[1].item_total, Decimal("29900.00"))
+            self.assertEqual(orders[1].shipping_total, Decimal("0.00"))
             self.assertEqual(orders[1].paid_at.date(), date(2026, 9, 8))
+
+    def test_sellmate_todayhouse_deducts_shipping_without_shipping_line(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "todayhouse.xlsx"
+            from openpyxl import Workbook
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "판매처명", "수량", "옵션판매단가", "금액", "판매처주문번호", "수령자",
+                "옵션상품명", "상품옵션", "사용자정의10", "재고매칭(1)옵션내용",
+            ])
+            sheet.append([
+                "오늘의집", 1, 29900, 32900, "ORDER-OHOUSE", "김하늘",
+                "상품 세트", "옵션 핑크", 3000, "상품 세트 옵션 핑크",
+            ])
+            workbook.save(source)
+            workbook.close()
+
+            orders = read_sellmate_orders(source, date(2026, 9, 8))
+
+            self.assertEqual(orders[0].item_total, Decimal("29900.00"))
+            self.assertEqual(orders[0].shipping_total, Decimal("0.00"))
+
+    def test_sellmate_samsung_card_uses_unit_price_times_quantity(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "samsung.xlsx"
+            from openpyxl import Workbook
+
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append([
+                "판매처명", "수량", "옵션판매단가", "금액", "판매처주문번호", "수령자",
+                "옵션상품명", "상품옵션", "사용자정의10", "재고매칭(1)옵션내용",
+            ])
+            for channel in ("삼성카드 복지몰", "삼성카드 쇼핑몰"):
+                sheet.append([
+                    channel, 2, 26900, 26900, f"ORDER-{channel}", "홍길동",
+                    "QP1000C", "블랙", None, "QP1000C 블랙",
+                ])
+            sheet.append([
+                "삼성카드 복지몰", 1, 36900, 25400, "ORDER-SINGLE", "김하늘",
+                "QP2000C", "토마토레드", None, "QP2000C 토마토레드",
+            ])
+            workbook.save(source)
+            workbook.close()
+
+            orders = read_sellmate_orders(source, date(2026, 9, 8))
+
+            self.assertEqual([order.item_total for order in orders], [
+                Decimal("53800.00"), Decimal("53800.00"), Decimal("25400.00")
+            ])
 
     def test_conversion_uses_each_sellmate_channel_customer(self) -> None:
         catalog = ReferenceCatalog(

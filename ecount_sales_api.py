@@ -140,18 +140,23 @@ def build_sales_payload(
 ) -> dict[str, list[dict[str, dict[str, str]]]]:
     if not lines:
         raise ValueError("전송할 판매전표 품목이 없습니다.")
-    warehouse_serials = {
-        warehouse: str(index)
-        for index, warehouse in enumerate(sorted({str(line.warehouse) for line in lines}), start=1)
+    voucher_serials = {
+        key: str(index)
+        for index, key in enumerate(sorted({
+            (str(line.warehouse), str(line.customer_code)) for line in lines
+        }), start=1)
     }
     rows: list[dict[str, dict[str, str]]] = []
-    for line in sorted(lines, key=lambda row: (str(row.warehouse), row.item_code, row.unit_price)):
+    for line in sorted(
+        lines,
+        key=lambda row: (str(row.warehouse), str(row.customer_code), row.item_code, row.unit_price),
+    ):
         total = line.total.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         supply = (total / Decimal("1.1")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
         vat = total - supply
         rows.append({"BulkDatas": {
             "IO_DATE": voucher_date.strftime("%Y%m%d"),
-            "UPLOAD_SER_NO": warehouse_serials[str(line.warehouse)],
+            "UPLOAD_SER_NO": voucher_serials[(str(line.warehouse), str(line.customer_code))],
             "CUST": str(line.customer_code),
             "CUST_DES": "",
             "EMP_CD": employee_code,

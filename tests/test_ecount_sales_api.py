@@ -63,6 +63,25 @@ class EcountSalesApiTests(unittest.TestCase):
         })
         self.assertEqual(result["success_count"], 2)
 
+    def test_payload_splits_vouchers_by_warehouse_and_customer(self) -> None:
+        lines = [
+            VoucherLine("CUST-A", "", "ITEM-1", "품목1", Decimal("1"), Decimal("1000"), "100"),
+            VoucherLine("CUST-A", "", "ITEM-2", "품목2", Decimal("1"), Decimal("2000"), "300"),
+            VoucherLine("CUST-B", "", "ITEM-3", "품목3", Decimal("1"), Decimal("3000"), "300"),
+            VoucherLine("CUST-B", "", "ITEM-4", "품목4", Decimal("1"), Decimal("4000"), "300"),
+        ]
+
+        payload = build_sales_payload(lines, date(2026, 9, 9), "00109")
+        rows = [row["BulkDatas"] for row in payload["SaleList"]]
+        grouped = {
+            (row["WH_CD"], row["CUST"]): row["UPLOAD_SER_NO"]
+            for row in rows
+        }
+
+        self.assertEqual(len(set(grouped.values())), 3)
+        self.assertNotEqual(grouped[("100", "CUST-A")], grouped[("300", "CUST-A")])
+        self.assertNotEqual(grouped[("300", "CUST-A")], grouped[("300", "CUST-B")])
+
 
 if __name__ == "__main__":
     unittest.main()
