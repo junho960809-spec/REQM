@@ -42,7 +42,7 @@ class EsmSourceDialog(QDialog):
         login_row = QHBoxLayout()
         self.login_button = QPushButton("ESM 로그인")
         self.login_button.clicked.connect(self.login)
-        self.login_status = QLabel("Edge 또는 Chrome에서 로그인합니다. 비밀번호는 저장하지 않습니다.")
+        self.login_status = QLabel("Chrome을 우선 사용하고, 실행할 수 없을 때만 Edge를 사용합니다.")
         login_row.addWidget(self.login_button)
         login_row.addWidget(self.login_status, 1)
         layout.addLayout(login_row)

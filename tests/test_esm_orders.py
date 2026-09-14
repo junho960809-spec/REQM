@@ -10,7 +10,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from esm_orders import EsmSession, STATUSES, channel_for, read_esm, merge_orders, export_summary
-from esm_browser import date_windows
+from esm_browser import browser_channels, date_windows
 from ecount_sales_core import ReferenceCatalog, convert_orders
 
 
@@ -35,6 +35,10 @@ def test_read_real_format_numeric_strings_and_reordered_headers(tmp_path):
     assert rows[0].ordered_at == datetime(2026, 9, 9)
     assert channel_for("A(test)") == "옥션"
     assert channel_for("G_test") == "지마켓"
+
+
+def test_esm_browser_prefers_chrome_before_edge():
+    assert browser_channels() == ("chrome", "msedge")
 
 
 @pytest.mark.parametrize("quantity,coupon", [(0, 0), ("", 0), ("nan", 0), (1.5, 0), (1, ""), (1, "bad"), (1, 999999), (1, -1)])

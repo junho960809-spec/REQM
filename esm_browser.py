@@ -16,6 +16,12 @@ from esm_orders import EsmSession, STATUSES
 
 LOGIN_URL = "https://signin.esmplus.com/login"
 ORDERS_URL = "https://www.esmplus.com/Escrow/SmartDelivery/SmartDeliveryRequestManagement?menuCode=TDM366"
+ESM_PROFILE_ROOT = Path.home() / ".reqm" / "esm-browser"
+
+
+def browser_channels() -> tuple[str, str]:
+    """Use Chrome first and keep Edge only as the compatibility fallback."""
+    return "chrome", "msedge"
 
 
 def date_windows(start: date, end: date):
@@ -65,24 +71,34 @@ class EsmBrowserWorker(QThread):
             raise ValueError("수집을 중지했습니다. 이미 내려받은 원본은 보관됩니다.")
 
     def run(self):
-        # Playwright 객체는 생성한 스레드 안에서만 사용한다. 인증정보는 저장하지 않는다.
+        # Playwright 객체는 생성한 스레드 안에서만 사용한다. 프로그램은 비밀번호를
+        # 저장하지 않고 브라우저 전용 프로필의 로그인 쿠키만 재사용한다.
         from playwright.sync_api import sync_playwright
         try:
             with sync_playwright() as pw:
-                browser = None
-                for channel in ("msedge", "chrome"):
+                context = None
+                selected_channel = ""
+                for channel in browser_channels():
                     try:
-                        browser = pw.chromium.launch(channel=channel, headless=False)
+                        profile = ESM_PROFILE_ROOT / channel
+                        profile.mkdir(parents=True, exist_ok=True)
+                        context = pw.chromium.launch_persistent_context(
+                            str(profile), channel=channel, headless=False, accept_downloads=True,
+                        )
+                        selected_channel = channel
                         break
                     except Exception:
                         continue
-                if browser is None:
+                if context is None:
                     raise ValueError("Microsoft Edge 또는 Google Chrome을 설치한 후 다시 실행해주세요.")
-                context = browser.new_context(accept_downloads=True)
-                page = context.new_page()
+                pages = context.pages
+                page = pages[0] if pages else context.new_page()
                 page.set_default_timeout(15000)
                 page.goto(LOGIN_URL, wait_until="domcontentloaded")
-                self.status_changed.emit("열린 ESM 브라우저에서 로그인해주세요. 비밀번호는 프로그램에 저장하지 않습니다.")
+                browser_label = "Chrome" if selected_channel == "chrome" else "Edge"
+                self.status_changed.emit(
+                    f"{browser_label}에서 ESM 로그인을 확인해주세요. 로그인 세션은 이 PC에서 재사용됩니다."
+                )
                 previous = False
                 while not self.stopping.is_set():
                     if page.is_closed():
@@ -119,9 +135,8 @@ class EsmBrowserWorker(QThread):
                     finally:
                         self.collecting_changed.emit(False)
                 context.close()
-                browser.close()
         except Exception as exc:
-            self.failed.emit(str(exc) if isinstance(exc, ValueError) else "ESM 브라우저를 열지 못했습니다. Edge/Chrome 설치와 네트워크 연결을 확인해주세요.")
+            self.failed.emit(str(exc) if isinstance(exc, ValueError) else "ESM 브라우저를 열지 못했습니다. Chrome/Edge 설치와 네트워크 연결을 확인해주세요.")
         finally:
             self.ready.emit(False)
 
