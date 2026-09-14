@@ -138,6 +138,32 @@ class ReviewIssue:
     amount: Decimal
     reason: str
     source_type: str = "원본"
+    product_order_no: str = ""
+    source_channel: str = CHANNEL_NAME
+
+
+def order_matches_issue(order: SmartStoreOrder, issue: ReviewIssue) -> bool:
+    """Match a review row to exactly one source order, even when row numbers repeat."""
+    if issue.product_order_no:
+        return (
+            order.product_order_no == issue.product_order_no
+            and order.source_channel == issue.source_channel
+            and order.source_type == issue.source_type
+        )
+    return (
+        order.source_type == issue.source_type
+        and order.source_channel == issue.source_channel
+        and order.source_row == issue.source_row
+        and order.order_no == issue.order_no
+        and order.product_name == issue.product_name
+        and order.options == issue.options
+    )
+
+
+def find_order_for_issue(
+    orders: Iterable[SmartStoreOrder], issue: ReviewIssue,
+) -> SmartStoreOrder | None:
+    return next((order for order in orders if order_matches_issue(order, issue)), None)
 
 
 @dataclass
@@ -1027,14 +1053,16 @@ def _append_review_line(
 
 def _issue(order: SmartStoreOrder, reason: str) -> ReviewIssue:
     return ReviewIssue(
-        order.source_row,
-        order.order_no,
-        order.product_name,
-        order.options,
-        order.quantity,
-        order.item_total,
-        reason,
-        order.source_type,
+        source_row=order.source_row,
+        order_no=order.order_no,
+        product_name=order.product_name,
+        options=order.options,
+        quantity=order.quantity,
+        amount=order.item_total,
+        reason=reason,
+        source_type=order.source_type,
+        product_order_no=order.product_order_no,
+        source_channel=order.source_channel,
     )
 
 

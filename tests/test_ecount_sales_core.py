@@ -15,6 +15,7 @@ from ecount_sales_core import (
     SmartStoreOrder,
     convert_orders,
     detect_smartstore_order_period,
+    find_order_for_issue,
     read_purchase_confirmed_orders,
     read_sellmate_orders,
     read_smartstore_orders,
@@ -68,6 +69,44 @@ class SalesCoreTests(unittest.TestCase):
         self.assertEqual(by_code["OPTION"].unit_price, Decimal("6900.00"))
         self.assertEqual(result.input_total, result.output_total)
         self.assertEqual(result.issues, [])
+
+    def test_review_issue_finds_exact_order_when_source_rows_repeat(self) -> None:
+        orders = [
+            SmartStoreOrder(
+                source_row=2,
+                order_no="ORDER-1000",
+                product_order_no="ESM|ORDER-1000|2",
+                paid_at=datetime(2026, 9, 14),
+                status="",
+                product_name="QP1000C",
+                options="화이트",
+                quantity=Decimal("1"),
+                item_total=Decimal("31500"),
+                source_type="ESM",
+                source_channel="리큐엠_스마트스토어",
+            ),
+            SmartStoreOrder(
+                source_row=2,
+                order_no="ORDER-2000",
+                product_order_no="ESM|ORDER-2000|2",
+                paid_at=datetime(2026, 9, 14),
+                status="",
+                product_name="QP2000C",
+                options="세이지민트",
+                quantity=Decimal("1"),
+                item_total=Decimal("44500"),
+                source_type="ESM",
+                source_channel="리큐엠_스마트스토어",
+            ),
+        ]
+
+        result = convert_orders(orders, self.catalog)
+        qp2000_issue = next(issue for issue in result.issues if issue.product_name == "QP2000C")
+        selected = find_order_for_issue(result.orders, qp2000_issue)
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.product_name, "QP2000C")
+        self.assertEqual(selected.product_order_no, "ESM|ORDER-2000|2")
 
     def test_set_main_amount_is_split_without_one_won_loss(self) -> None:
         order = SmartStoreOrder(
