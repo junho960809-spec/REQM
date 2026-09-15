@@ -3,12 +3,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import sys
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal
+from PySide6.QtCore import QDate, QObject, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,7 +65,9 @@ from ecount_sales_api_dialog import EcountSalesApiDialog
 from esm_dialog import EsmSourceDialog
 from closedmall_price_import import ClosedMallPriceRow, read_closedmall_price_summary
 from channel_settings import load_shipping_rules, save_shipping_rules
-from ecount_sales_api import load_api_key, load_settings, save_api_key, save_settings
+from ecount_sales_api import (
+    load_api_key, load_settings, protect_secret, save_api_key, save_settings, unprotect_secret,
+)
 from marketplace_browser import (
     launch_marketplace,
     load_browser_settings,
@@ -81,6 +84,26 @@ SPECIAL_ITEMS_PATH = APP_DIR / "special_warehouse_items.json"
 DELETED_ITEMS_PATH = APP_DIR / "deleted_db_items.json"
 BROWSER_SETTINGS_PATH = APP_DIR / "marketplace_browser.json"
 BROWSER_PROFILE_DIR = APP_DIR / ".marketplace_sessions"
+LOGIN_CREDENTIAL_PATH = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "REQM" / "sales_login.json"
+
+
+def load_saved_login(path: Path = LOGIN_CREDENTIAL_PATH) -> tuple[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return str(data.get("email", "")), unprotect_secret(str(data.get("password", "")))
+    except Exception:
+        return "", ""
+
+
+def save_login(email: str, password: str, path: Path = LOGIN_CREDENTIAL_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"email": email, "password": protect_secret(password)}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def clear_saved_login(path: Path = LOGIN_CREDENTIAL_PATH) -> None:
+    path.unlink(missing_ok=True)
 
 
 def search_text_matches(keyword: str, searchable: str) -> bool:
@@ -272,6 +295,91 @@ class SupabaseConnectWorker(QObject):
         finally:
             self.password = ""
             self.finished.emit()
+
+
+class SalesLoginDialog(QDialog):
+    def __init__(self, parent=None, auto_login: bool = True) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("REQM 판매전표 로그인")
+        self.setFixedSize(470, 330)
+        self.client = None
+        self.catalog = None
+        self.thread: QThread | None = None
+        self.worker: SupabaseConnectWorker | None = None
+        saved_email, saved_password = load_saved_login()
+        layout = QVBoxLayout(self)
+        title = QLabel("REQM 로그인")
+        title.setStyleSheet("font-size:24pt;font-weight:700;color:#102A43;")
+        guide = QLabel("등록된 프로그램 계정으로 로그인한 후 판매전표를 사용할 수 있습니다.")
+        guide.setStyleSheet("color:#627D98;")
+        self.email = QLineEdit(saved_email); self.email.setPlaceholderText("이메일")
+        self.password = QLineEdit(saved_password); self.password.setPlaceholderText("비밀번호")
+        self.password.setEchoMode(QLineEdit.Password)
+        self.remember = QCheckBox("로그인 정보 저장")
+        self.remember.setChecked(bool(saved_email and saved_password))
+        self.status = QLabel("저장된 계정은 이 Windows 사용자에게만 암호화되어 보관됩니다.")
+        self.status.setWordWrap(True); self.status.setStyleSheet("color:#526D82;")
+        self.login_button = QPushButton("로그인")
+        self.login_button.setObjectName("primary")
+        self.login_button.clicked.connect(self.login)
+        cancel = QPushButton("종료"); cancel.clicked.connect(self.reject)
+        actions = QHBoxLayout(); actions.addWidget(cancel); actions.addWidget(self.login_button, 1)
+        for widget in (title, guide, self.email, self.password, self.remember, self.status): layout.addWidget(widget)
+        layout.addStretch(); layout.addLayout(actions)
+        self.email.returnPressed.connect(self.login); self.password.returnPressed.connect(self.login)
+        self.setStyleSheet("""
+            QDialog { background:#F5F7FB; font-family:'Malgun Gothic'; font-size:10pt; }
+            QLineEdit { background:white;border:1px solid #BCCCDC;border-radius:7px;padding:10px; }
+            QPushButton { background:#E6EEF7;border:0;border-radius:7px;padding:10px;font-weight:600; }
+            QPushButton#primary { background:#111827;color:white; }
+        """)
+        if auto_login and saved_email and saved_password:
+            self.status.setText("저장된 계정으로 자동 로그인합니다...")
+            QTimer.singleShot(250, self.login)
+
+    def login(self) -> None:
+        if self.thread is not None:
+            return
+        config = load_config()
+        url = str(config.get("supabase_url", "")).strip().rstrip(".")
+        key = str(config.get("supabase_publishable_key", "")).strip()
+        if not url or not key:
+            QMessageBox.critical(self, "설정 오류", "config.json에 Supabase URL과 publishable key가 필요합니다.")
+            return
+        email, password = self.email.text().strip(), self.password.text()
+        if not email or not password:
+            QMessageBox.information(self, "로그인 정보", "이메일과 비밀번호를 입력해주세요.")
+            return
+        self.login_button.setEnabled(False); self.login_button.setText("로그인 중...")
+        self.status.setText("계정과 최신 공용 DB를 확인하고 있습니다.")
+        self.thread = QThread(self)
+        self.worker = SupabaseConnectWorker(url, key, email, password)
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.connected.connect(self._connected)
+        self.worker.failed.connect(self._failed)
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.finished.connect(self.worker.deleteLater)
+        self.thread.finished.connect(self.thread.deleteLater)
+        self.thread.finished.connect(self._finished)
+        self.thread.start()
+
+    def _connected(self, client, catalog) -> None:
+        self.client, self.catalog = client, catalog
+        if self.remember.isChecked():
+            save_login(self.email.text().strip(), self.password.text())
+        else:
+            clear_saved_login()
+        self.status.setText("로그인 완료 · 프로그램을 여는 중입니다.")
+        self.accept()
+
+    def _failed(self, message: str) -> None:
+        self.status.setText(f"로그인 실패: {message}")
+        self.status.setStyleSheet("color:#B91C1C;font-weight:600;")
+
+    def _finished(self) -> None:
+        self.thread = None; self.worker = None
+        self.login_button.setEnabled(True); self.login_button.setText("로그인")
 
 
 class SetMappingDialog(QDialog):
@@ -1647,14 +1755,24 @@ class SalesVoucherWindow(QMainWindow):
         layout.setContentsMargins(14, 8, 14, 10)
         layout.setSpacing(7)
 
-        title = QLabel("판매전표 반자동화")
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title = QLabel("판매전표 자동화")
         title.setObjectName("title")
-        subtitle = QLabel("원본 주문을 자동 매칭하고, 예외만 확인한 뒤 이카운트 입력자료를 만듭니다.")
+        subtitle = QLabel("파일 입력 → 분석·검수 → Excel 저장 또는 이카운트 입력")
         subtitle.setObjectName("subtitle")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
+        title_box.addWidget(title); title_box.addWidget(subtitle)
+        header.addLayout(title_box); header.addStretch()
+        self.header_marketplace_button = QPushButton("판매처 설정")
+        self.header_marketplace_button.clicked.connect(self.open_marketplace_settings)
+        self.header_db_button = QPushButton("DB 관리")
+        self.header_account_button = QPushButton("계정 변경")
+        self.header_account_button.clicked.connect(self.change_login_account)
+        header.addWidget(self.header_marketplace_button); header.addWidget(self.header_db_button); header.addWidget(self.header_account_button)
+        layout.addLayout(header)
 
-        connection = QGroupBox("Supabase 최신 DB 연결")
+        connection = QGroupBox("Supabase 최신 DB 연결", root)
+        self.connection_panel = connection
         connection_layout = QHBoxLayout(connection)
         connection_layout.setContentsMargins(10, 5, 10, 7)
         connection_layout.setSpacing(6)
@@ -1669,30 +1787,24 @@ class SalesVoucherWindow(QMainWindow):
         connection_layout.addWidget(self.connect_button)
         connection_layout.addWidget(self.db_status, 2)
         connection.setMaximumHeight(72)
-        layout.addWidget(connection)
+        connection.setVisible(False)
 
-        options = QGroupBox("변환 설정")
+        options = QGroupBox("1. 파일 입력")
         options_layout = QGridLayout(options)
         options_layout.setContentsMargins(10, 5, 10, 7)
         options_layout.setHorizontalSpacing(6)
         options_layout.setVerticalSpacing(5)
-        browse_button = QPushButton("스마트스토어 전표")
-        browse_button.clicked.connect(self.choose_file)
-        sellmate_button = QPushButton("폐쇄몰·외부 판매처 전표")
-        sellmate_button.clicked.connect(self.choose_sellmate_file)
-        esm_button = QPushButton("ESM 주문 수집")
-        esm_button.clicked.connect(self.choose_esm_orders)
-        marketplace_settings_button = QPushButton("판매처 설정")
-        marketplace_settings_button.clicked.connect(self.open_marketplace_settings)
+        self.input_type = QComboBox()
+        self.input_type.addItems(["스마트스토어", "폐쇄몰·외부 판매처", "ESM 옥션·지마켓"])
+        choose_source_button = QPushButton("입력 파일 선택")
+        choose_source_button.clicked.connect(self.select_input_source)
         analyze_button = QPushButton("분석 및 자동 매칭")
         analyze_button.setObjectName("primary")
         analyze_button.clicked.connect(self.analyze)
         options_layout.addWidget(QLabel("입력 유형"), 0, 0)
-        options_layout.addWidget(browse_button, 0, 1, 1, 2)
-        options_layout.addWidget(sellmate_button, 0, 3, 1, 3)
-        options_layout.addWidget(esm_button, 0, 6, 1, 2)
-        options_layout.addWidget(marketplace_settings_button, 0, 8, 1, 2)
-        options_layout.addWidget(self.source_mode_label, 0, 10, 1, 3)
+        options_layout.addWidget(self.input_type, 0, 1, 1, 3)
+        options_layout.addWidget(choose_source_button, 0, 4, 1, 2)
+        options_layout.addWidget(self.source_mode_label, 0, 6, 1, 7)
         options_layout.addWidget(QLabel("선택 파일"), 1, 0)
         options_layout.addWidget(self.file_path, 1, 1, 1, 12)
         options_layout.addWidget(QLabel("추가 파일"), 2, 0)
@@ -1706,7 +1818,7 @@ class SalesVoucherWindow(QMainWindow):
         options_layout.addWidget(analyze_button, 3, 1, 1, 12)
         options_layout.setColumnStretch(1, 1)
         options_layout.setColumnStretch(3, 1)
-        options.setMaximumHeight(172)
+        options.setMaximumHeight(170)
         layout.addWidget(options)
 
         cards = QHBoxLayout()
@@ -1714,10 +1826,7 @@ class SalesVoucherWindow(QMainWindow):
             ("대상 주문행", self.summary_orders, "#1D4ED8"),
             ("전표 품목행", self.summary_lines, "#047857"),
             ("확인 필요", self.summary_issues, "#B45309"),
-            ("합산 최초 상품금액", self.summary_initial_total, "#334155"),
-            ("합산 최종 상품금액", self.summary_final_total, "#0F766E"),
             ("전표 총액(배송비 포함)", self.summary_total, "#0F172A"),
-            ("전표 배송비", self.summary_shipping, "#7C3AED"),
             ("금액 차이", self.summary_difference, "#B91C1C"),
         ):
             card = QFrame()
@@ -1734,7 +1843,13 @@ class SalesVoucherWindow(QMainWindow):
             cards.addWidget(card)
         layout.addLayout(cards)
 
+        view_bar = QHBoxLayout()
+        view_bar.addWidget(QLabel("2. 분석·검수"))
+        self.result_view = QComboBox(); self.result_view.addItems(["전표 상세", "품목별 집계"])
+        view_bar.addWidget(self.result_view); view_bar.addStretch()
+        layout.addLayout(view_bar)
         tabs = QTabWidget()
+        self.main_tabs = tabs
         self.lines_table.setHorizontalHeaderLabels(
             ["품목코드", "품목명", "판매처명", "수량", "단가", "금액", "창고", "원본건수"]
         )
@@ -1776,7 +1891,7 @@ class SalesVoucherWindow(QMainWindow):
         result_search_layout.addWidget(self.result_filter_count)
         result_layout.addLayout(result_search_layout)
         result_layout.addWidget(self.lines_table, 1)
-        tabs.addTab(result_tab, "자동 변환 결과")
+        self.result_tab_index = tabs.addTab(result_tab, "전표 결과")
 
         self.pivot_table.setHorizontalHeaderLabels(["품목코드", "품목명", "합계 수량", "평균 단가", "합계 금액"])
         self.pivot_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -1791,7 +1906,7 @@ class SalesVoucherWindow(QMainWindow):
         pivot_layout.setContentsMargins(5, 5, 5, 5)
         self._add_column_filter(pivot_layout, self.pivot_table, ["품목코드", "품목명", "합계 수량", "평균 단가", "합계 금액"])
         pivot_layout.addWidget(self.pivot_table)
-        tabs.addTab(pivot_tab, "품목 집계")
+        self.pivot_tab_index = tabs.addTab(pivot_tab, "품목 집계")
 
         self.issues_table.setColumnCount(7)
         self.issues_table.setHorizontalHeaderLabels(["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"])
@@ -1813,7 +1928,7 @@ class SalesVoucherWindow(QMainWindow):
             ["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"],
         )
         issues_layout.addWidget(self.issues_table)
-        tabs.addTab(issues_tab, "확인 필요")
+        self.issues_tab_index = tabs.addTab(issues_tab, "확인 필요")
 
         self.shipping_table.setHorizontalHeaderLabels(
             ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액(참고)", "전표 배송비", "구분"]
@@ -1832,7 +1947,7 @@ class SalesVoucherWindow(QMainWindow):
             ["원본행", "배송비 묶음번호", "원배송비", "추가배송비", "할인액", "전표 배송비", "구분"],
         )
         shipping_layout.addWidget(self.shipping_table)
-        tabs.addTab(shipping_tab, "배송비 검수")
+        self.shipping_tab_index = tabs.addTab(shipping_tab, "배송비 검수")
 
         db_tab = QWidget()
         db_layout = QVBoxLayout(db_tab)
@@ -1917,7 +2032,11 @@ class SalesVoucherWindow(QMainWindow):
         db_subtabs.addTab(rule_tab, "상품 매칭·가격")
 
         db_layout.addWidget(db_subtabs)
-        tabs.addTab(db_tab, "DB 관리")
+        self.db_tab_index = tabs.addTab(db_tab, "DB 관리")
+        tabs.setTabVisible(self.pivot_tab_index, False)
+        tabs.setTabVisible(self.db_tab_index, False)
+        self.result_view.currentIndexChanged.connect(self.change_result_view)
+        self.header_db_button.clicked.connect(self.show_db_management)
         layout.addWidget(tabs, 1)
 
         bottom = QHBoxLayout()
@@ -2179,6 +2298,30 @@ class SalesVoucherWindow(QMainWindow):
         self.confirmed_file_path.clear()
         self.source_mode_label.setText(f"ESM · {self.esm_session.manifest['order_count']:,}행")
         self.source_mode_label.setStyleSheet("color:#1D4ED8;font-weight:700;")
+
+    def select_input_source(self) -> None:
+        selected = self.input_type.currentText()
+        if selected == "스마트스토어":
+            self.choose_file()
+        elif selected == "폐쇄몰·외부 판매처":
+            self.choose_sellmate_file()
+        else:
+            self.choose_esm_orders()
+
+    def change_result_view(self, index: int) -> None:
+        target = self.result_tab_index if index == 0 else self.pivot_tab_index
+        self.main_tabs.setTabVisible(self.pivot_tab_index, index == 1)
+        self.main_tabs.setTabVisible(self.db_tab_index, False)
+        self.main_tabs.setCurrentIndex(target)
+
+    def show_db_management(self) -> None:
+        self.main_tabs.setTabVisible(self.db_tab_index, True)
+        self.main_tabs.setCurrentIndex(self.db_tab_index)
+
+    def change_login_account(self) -> None:
+        dialog = SalesLoginDialog(self, auto_login=False)
+        if dialog.exec() == QDialog.Accepted:
+            self._on_db_connected(dialog.client, dialog.catalog)
         self.analyze()
 
     def open_marketplace_login(self) -> None:
@@ -3561,6 +3704,11 @@ def main() -> int:
         dialog.close()
         window.close()
         return 0
+    login = SalesLoginDialog()
+    if login.exec() != QDialog.Accepted:
+        window.close()
+        return 0
+    window._on_db_connected(login.client, login.catalog)
     window.show()
     return app.exec()
 

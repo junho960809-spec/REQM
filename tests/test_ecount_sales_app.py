@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 from datetime import datetime
 from decimal import Decimal
@@ -9,7 +10,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication, QAbstractItemView, QTabWidget
 
-from ecount_sales_app import ItemOrderDetailsDialog, MarketplaceSettingsDialog, SalesVoucherWindow, split_voucher_line_total
+from pathlib import Path
+
+from ecount_sales_app import (
+    ItemOrderDetailsDialog, MarketplaceSettingsDialog, SalesLoginDialog, SalesVoucherWindow,
+    clear_saved_login, load_saved_login, save_login, split_voucher_line_total,
+)
 from ecount_sales_api_dialog import EcountSalesApiDialog
 from ecount_sales_core import ConversionResult, ItemOrderDetail, SmartStoreOrder, VoucherLine
 
@@ -24,15 +30,28 @@ class SalesAppEditTests(unittest.TestCase):
             "CUST", "", "ITEM", "품목", Decimal("3"), Decimal("100"), "300",
             source_orders=["ORDER-1"],
         )
-
         lines = split_voucher_line_total(original, Decimal("3"), Decimal("1000"), "100")
-
         self.assertEqual(sum((line.total for line in lines), Decimal("0")), Decimal("1000"))
         self.assertEqual({line.warehouse for line in lines}, {"100"})
         self.assertEqual(
             sorted((line.quantity, line.unit_price) for line in lines),
             [(Decimal("1"), Decimal("334")), (Decimal("2"), Decimal("333"))],
         )
+
+    def test_saved_login_is_encrypted_and_can_be_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "login.json"
+            save_login("worker@example.com", "secret-password", path)
+            self.assertNotIn("secret-password", path.read_text(encoding="utf-8"))
+            self.assertEqual(load_saved_login(path), ("worker@example.com", "secret-password"))
+            clear_saved_login(path)
+            self.assertFalse(path.exists())
+
+    def test_login_dialog_precedes_work_screen_and_supports_remember(self) -> None:
+        dialog = SalesLoginDialog(auto_login=False)
+        self.assertEqual(dialog.windowTitle(), "REQM 판매전표 로그인")
+        self.assertEqual(dialog.remember.text(), "로그인 정보 저장")
+        dialog.close()
 
     def test_order_detail_dialog_applies_amount_and_warehouse_by_buyer(self) -> None:
         detail = ItemOrderDetail(
@@ -100,6 +119,15 @@ class SalesAppEditTests(unittest.TestCase):
         }
         self.assertTrue(visibility["오늘의집"])
         self.assertFalse(visibility["11번가"])
+        window.close()
+
+    def test_main_screen_uses_compact_workflow_navigation(self) -> None:
+        window = SalesVoucherWindow()
+        self.assertEqual([window.input_type.itemText(index) for index in range(window.input_type.count())],
+                         ["스마트스토어", "폐쇄몰·외부 판매처", "ESM 옥션·지마켓"])
+        self.assertFalse(window.main_tabs.isTabVisible(window.pivot_tab_index))
+        self.assertFalse(window.main_tabs.isTabVisible(window.db_tab_index))
+        self.assertEqual(window.main_tabs.tabText(window.result_tab_index), "전표 결과")
         window.close()
 
     def test_api_preview_shows_source_channel(self) -> None:
