@@ -371,7 +371,6 @@ class SalesLoginDialog(QDialog):
         else:
             clear_saved_login()
         self.status.setText("로그인 완료 · 프로그램을 여는 중입니다.")
-        self.accept()
 
     def _failed(self, message: str) -> None:
         self.status.setText(f"로그인 실패: {message}")
@@ -380,6 +379,8 @@ class SalesLoginDialog(QDialog):
     def _finished(self) -> None:
         self.thread = None; self.worker = None
         self.login_button.setEnabled(True); self.login_button.setText("로그인")
+        if self.client is not None and self.catalog is not None:
+            QTimer.singleShot(0, self.accept)
 
 
 class SetMappingDialog(QDialog):
@@ -3689,6 +3690,9 @@ class SalesVoucherWindow(QMainWindow):
 def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # 로그인 창이 닫히고 메인 창을 표시하기 전의 짧은 구간을 프로그램 종료로
+    # 오인하지 않도록 로그인 단계에서는 마지막 창 자동 종료를 잠시 비활성화한다.
+    app.setQuitOnLastWindowClosed(False)
     window = SalesVoucherWindow()
     if len(sys.argv) == 3 and sys.argv[1] == "--esm-self-check":
         # 배포 EXE 안의 Qt와 Playwright 드라이버를 네트워크 연결 없이 점검한다.
@@ -3710,6 +3714,7 @@ def main() -> int:
         return 0
     window._on_db_connected(login.client, login.catalog)
     window.show()
+    app.setQuitOnLastWindowClosed(True)
     return app.exec()
 
 
