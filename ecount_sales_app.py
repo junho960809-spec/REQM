@@ -205,6 +205,22 @@ def apply_login_catalog(window: "SalesVoucherWindow", client: object, catalog: o
         )
 
 
+def show_authenticated_window(
+    app: QApplication,
+    window: "SalesVoucherWindow",
+    login: "SalesLoginDialog",
+) -> None:
+    """Switch from login to the main window inside one QApplication event loop."""
+    client, catalog = login.client, login.catalog
+    write_db_log("로그인 승인 신호 수신 · 메인 화면 표시")
+    window.show()
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+    app.setQuitOnLastWindowClosed(True)
+    QTimer.singleShot(0, lambda: apply_login_catalog(window, client, catalog))
+
+
 def load_config() -> dict[str, str]:
     for config_path in (APP_DIR / "config.json", APP_DIR.parent / "config.json", SOURCE_DIR / "config.json"):
         if config_path.exists():
@@ -3727,17 +3743,13 @@ def main() -> int:
         dialog.close()
         window.close()
         return 0
+    # QDialog.exec()의 중첩 이벤트 루프를 사용하지 않는다. 로그인과 메인 화면을
+    # 하나의 QApplication 이벤트 루프에서 전환해야 일부 Windows 환경에서
+    # 로그인 창이 닫힌 뒤 애플리케이션이 함께 멈추는 현상을 피할 수 있다.
     login = SalesLoginDialog()
-    if login.exec() != QDialog.Accepted:
-        window.close()
-        return 0
-    client, catalog = login.client, login.catalog
-    window.show()
-    window.showNormal()
-    window.raise_()
-    window.activateWindow()
-    app.setQuitOnLastWindowClosed(True)
-    QTimer.singleShot(0, lambda: apply_login_catalog(window, client, catalog))
+    login.accepted.connect(lambda: show_authenticated_window(app, window, login))
+    login.rejected.connect(app.quit)
+    login.show()
     return app.exec()
 
 

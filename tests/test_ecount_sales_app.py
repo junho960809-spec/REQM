@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime
 from decimal import Decimal
 
@@ -14,7 +15,8 @@ from pathlib import Path
 
 from ecount_sales_app import (
     ItemOrderDetailsDialog, MarketplaceSettingsDialog, SalesLoginDialog, SalesVoucherWindow,
-    clear_saved_login, load_saved_login, save_login, split_voucher_line_total,
+    clear_saved_login, load_saved_login, save_login, show_authenticated_window,
+    split_voucher_line_total,
 )
 from ecount_sales_api_dialog import EcountSalesApiDialog
 from ecount_sales_core import ConversionResult, ItemOrderDetail, SmartStoreOrder, VoucherLine
@@ -52,6 +54,30 @@ class SalesAppEditTests(unittest.TestCase):
         self.assertEqual(dialog.windowTitle(), "REQM 판매전표 로그인")
         self.assertEqual(dialog.remember.text(), "로그인 정보 저장")
         dialog.close()
+
+    def test_authenticated_transition_shows_main_window_before_catalog_apply(self) -> None:
+        events = []
+
+        class FakeApp:
+            def setQuitOnLastWindowClosed(self, enabled):
+                events.append(("quit_on_close", enabled))
+
+        class FakeWindow:
+            def show(self): events.append("show")
+            def showNormal(self): events.append("show_normal")
+            def raise_(self): events.append("raise")
+            def activateWindow(self): events.append("activate")
+
+        class FakeLogin:
+            client = object()
+            catalog = object()
+
+        with patch("ecount_sales_app.QTimer.singleShot") as single_shot:
+            show_authenticated_window(FakeApp(), FakeWindow(), FakeLogin())
+
+        self.assertEqual(events[:2], ["show", "show_normal"])
+        self.assertIn(("quit_on_close", True), events)
+        single_shot.assert_called_once()
 
     def test_order_detail_dialog_applies_amount_and_warehouse_by_buyer(self) -> None:
         detail = ItemOrderDetail(
