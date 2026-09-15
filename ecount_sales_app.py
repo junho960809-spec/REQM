@@ -12,6 +12,7 @@ from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QCompleter,
     QDateEdit,
@@ -62,6 +63,8 @@ from ecount_sales_core import (
 from ecount_sales_api_dialog import EcountSalesApiDialog
 from esm_dialog import EsmSourceDialog
 from closedmall_price_import import ClosedMallPriceRow, read_closedmall_price_summary
+from channel_settings import load_shipping_rules, save_shipping_rules
+from ecount_sales_api import load_api_key, load_settings, save_api_key, save_settings
 from marketplace_browser import (
     launch_marketplace,
     load_browser_settings,
@@ -1245,6 +1248,327 @@ class ClosedMallPriceImportDialog(QDialog):
         return result
 
 
+class MarketplaceSettingsDialog(QDialog):
+    """판매처 관련 규칙과 외부 서비스 연결을 한곳에서 관리한다."""
+
+    METHOD_LABELS = {
+        "separate": "배송비 품목으로 분리",
+        "subtract": "상품금액에서 차감",
+        "included": "상품금액에 포함",
+        "exclude": "전표에서 제외",
+    }
+    SOURCE_LABELS = {
+        "custom10": "셀메이트 기준",
+        "amount_minus_unit": "금액 - 옵션단가×수량",
+        "shipping_total": "배송비 합계",
+        "none": "사용하지 않음",
+    }
+
+    def __init__(self, owner: "SalesVoucherWindow") -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("판매처 설정")
+        self.resize(880, 600)
+        root = QVBoxLayout(self)
+        title = QLabel("판매처 설정")
+        title.setStyleSheet("font-size:17pt;font-weight:700;color:#173F5F;")
+        root.addWidget(title)
+        tabs = QTabWidget()
+        tabs.addTab(self._shipping_tab(), "배송비 규칙")
+        tabs.addTab(self._login_tab(), "로그인·수집")
+        tabs.addTab(self._ecount_tab(), "이카운트 연결")
+        tabs.addTab(self._channel_tab(), "판매처 기본정보")
+        root.addWidget(tabs, 1)
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.button(QDialogButtonBox.Close).setText("닫기")
+        close.rejected.connect(self.reject)
+        root.addWidget(close)
+
+    def _shipping_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        guide = QLabel("판매처별 배송비 계산 규칙입니다. 저장 후 새로 분석하는 파일부터 적용됩니다.")
+        guide.setStyleSheet("color:#526D82;")
+        layout.addWidget(guide)
+        self.shipping_rules = load_shipping_rules()
+        controls = QGridLayout()
+        self.rule_channel = QComboBox()
+        channel_names = sorted(set(self.shipping_rules) | set(getattr(self.owner.catalog, "channels", {}) or {}))
+        self.rule_channel.addItems(channel_names)
+        self.rule_channel.setEditable(True)
+        self.rule_method = QComboBox()
+        self.rule_method.addItems(self.METHOD_LABELS.values())
+        self.rule_source = QComboBox()
+        self.rule_source.addItems(self.SOURCE_LABELS.values())
+        self.rule_fee = QSpinBox()
+        self.rule_fee.setRange(0, 1000000)
+        self.rule_fee.setSingleStep(500)
+        self.rule_fee.setSuffix("원")
+        self.rule_island = QComboBox()
+        self.rule_island.addItems(["이미 포함 · 추가 안 함", "별도 가산", "제외"])
+        self.rule_active = QCheckBox("사용")
+        save_button = QPushButton("규칙 저장")
+        save_button.setObjectName("primary")
+        save_button.clicked.connect(self._save_shipping_rule)
+        delete_button = QPushButton("선택 규칙 삭제")
+        delete_button.clicked.connect(self._delete_shipping_rule)
+        fields = (("판매처", self.rule_channel), ("처리 방식", self.rule_method),
+                  ("배송비 원본", self.rule_source), ("기본 배송비", self.rule_fee),
+                  ("도서산간", self.rule_island), ("사용 여부", self.rule_active))
+        for index, (label, widget) in enumerate(fields):
+            controls.addWidget(QLabel(label), index // 3 * 2, index % 3)
+            controls.addWidget(widget, index // 3 * 2 + 1, index % 3)
+        controls.addWidget(save_button, 4, 2)
+        controls.addWidget(delete_button, 4, 1)
+        layout.addLayout(controls)
+        self.rule_table = QTableWidget(0, 6)
+        self.rule_table.setHorizontalHeaderLabels(["판매처", "처리 방식", "배송비 원본", "기본 배송비", "도서산간", "상태"])
+        self.rule_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.rule_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.rule_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.rule_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.rule_table.cellClicked.connect(self._select_shipping_rule)
+        layout.addWidget(self.rule_table, 1)
+        self._refresh_shipping_rules()
+        return tab
+
+    def _refresh_shipping_rules(self) -> None:
+        self.rule_table.setRowCount(0)
+        island_labels = {"already_included": "이미 포함", "add": "별도 가산", "exclude": "제외"}
+        for channel, rule in sorted(self.shipping_rules.items()):
+            if rule.get("deleted"):
+                continue
+            row = self.rule_table.rowCount()
+            self.rule_table.insertRow(row)
+            values = (channel, self.METHOD_LABELS.get(rule.get("method"), "배송비 품목으로 분리"),
+                      self.SOURCE_LABELS.get(rule.get("source"), "셀메이트 기준"),
+                      f"{int(rule.get('default_fee', 0)):,}원",
+                      island_labels.get(rule.get("island"), "이미 포함"), "사용" if rule.get("active", True) else "중지")
+            for column, value in enumerate(values):
+                self.rule_table.setItem(row, column, QTableWidgetItem(value))
+
+    def _select_shipping_rule(self, row: int, _column: int) -> None:
+        channel = self.rule_table.item(row, 0).text()
+        rule = self.shipping_rules[channel]
+        self.rule_channel.setCurrentText(channel)
+        self.rule_method.setCurrentText(self.METHOD_LABELS.get(rule.get("method"), self.METHOD_LABELS["separate"]))
+        self.rule_source.setCurrentText(self.SOURCE_LABELS.get(rule.get("source"), self.SOURCE_LABELS["custom10"]))
+        self.rule_fee.setValue(int(rule.get("default_fee", 0)))
+        self.rule_island.setCurrentText({"already_included": "이미 포함 · 추가 안 함", "add": "별도 가산", "exclude": "제외"}.get(rule.get("island"), "이미 포함 · 추가 안 함"))
+        self.rule_active.setChecked(bool(rule.get("active", True)))
+
+    def _save_shipping_rule(self) -> None:
+        channel = self.rule_channel.currentText().strip()
+        if not channel:
+            QMessageBox.warning(self, "판매처 확인", "판매처명을 입력해주세요.")
+            return
+        method = next(key for key, value in self.METHOD_LABELS.items() if value == self.rule_method.currentText())
+        source = next(key for key, value in self.SOURCE_LABELS.items() if value == self.rule_source.currentText())
+        island = {"이미 포함 · 추가 안 함": "already_included", "별도 가산": "add", "제외": "exclude"}[self.rule_island.currentText()]
+        self.shipping_rules[channel] = {"method": method, "source": source, "default_fee": self.rule_fee.value(),
+                                        "island": island, "active": self.rule_active.isChecked()}
+        save_shipping_rules(self.shipping_rules)
+        self._refresh_shipping_rules()
+        QMessageBox.information(self, "저장 완료", f"{channel} 배송비 규칙을 저장했습니다. 다음 분석부터 적용됩니다.")
+
+    def _delete_shipping_rule(self) -> None:
+        rows = sorted({index.row() for index in self.rule_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "선택 필요", "삭제할 배송비 규칙을 선택해주세요.")
+            return
+        channels = [self.rule_table.item(row, 0).text() for row in rows]
+        if QMessageBox.question(self, "배송비 규칙 일괄 삭제", f"선택한 배송비 규칙 {len(channels):,}개를 삭제할까요?\n삭제 후에는 기본 규칙이 적용됩니다.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        for channel in channels:
+            self.shipping_rules[channel] = {"deleted": True}
+        save_shipping_rules(self.shipping_rules)
+        self._refresh_shipping_rules()
+
+    def _login_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.addWidget(QLabel("비밀번호는 저장하지 않고 Chrome/Edge 전용 프로필의 로그인 세션만 재사용합니다."))
+        self.browser_settings = load_browser_settings(BROWSER_SETTINGS_PATH)
+        form = QFormLayout()
+        self.browser_selectors = {}
+        for market in ("옥션", "지마켓"):
+            row = QWidget(); row_layout = QHBoxLayout(row); row_layout.setContentsMargins(0, 0, 0, 0)
+            selector = QComboBox(); selector.addItems(["자동 선택", "Chrome", "Edge IE 모드"])
+            selector.setCurrentText(self.browser_settings.get(market, "자동 선택"))
+            button = QPushButton(f"{market} 로그인 열기")
+            button.clicked.connect(lambda _checked=False, name=market: self._open_market(name))
+            row_layout.addWidget(selector, 1); row_layout.addWidget(button)
+            form.addRow(market, row); self.browser_selectors[market] = selector
+        layout.addLayout(form)
+        browser_save = QPushButton("브라우저 설정 저장")
+        browser_save.clicked.connect(self._save_browser_settings)
+        esm = QPushButton("ESM 로그인 세션 확인·주문 수집")
+        esm.setObjectName("primary")
+        esm.clicked.connect(self.owner.choose_esm_orders)
+        layout.addWidget(browser_save)
+        layout.addWidget(esm)
+        layout.addStretch()
+        return tab
+
+    def _open_market(self, market: str) -> None:
+        try:
+            browser_name, _ = launch_marketplace(market, self.browser_selectors[market].currentText(), BROWSER_PROFILE_DIR)
+            QMessageBox.information(self, "로그인 창 열기", f"{market} 로그인 페이지를 {browser_name}(으)로 열었습니다.")
+        except Exception as exc:
+            QMessageBox.warning(self, "브라우저 실행 실패", str(exc))
+
+    def _save_browser_settings(self) -> None:
+        save_browser_settings(BROWSER_SETTINGS_PATH, {name: field.currentText() for name, field in self.browser_selectors.items()})
+        QMessageBox.information(self, "저장 완료", "브라우저 우선순위를 저장했습니다.")
+
+    def _ecount_tab(self) -> QWidget:
+        tab = QWidget(); layout = QVBoxLayout(tab); form = QFormLayout()
+        config = load_settings()
+        self.ec_company = QLineEdit(str(config.get("company_code", "")))
+        self.ec_user = QLineEdit(str(config.get("user_id", "")))
+        self.ec_key = QLineEdit(load_api_key(self.ec_user.text())); self.ec_key.setEchoMode(QLineEdit.Password)
+        self.ec_zone = QLineEdit(str(config.get("zone", "")))
+        self.ec_employee = QLineEdit(str(config.get("employee_code", "00109")))
+        self.ec_test = QCheckBox("테스트 API 키 사용"); self.ec_test.setChecked(bool(config.get("test_mode", False)))
+        for label, field in (("회사코드", self.ec_company), ("사용자 ID", self.ec_user), ("API 인증키", self.ec_key),
+                             ("ZONE", self.ec_zone), ("담당자코드", self.ec_employee), ("API 환경", self.ec_test)):
+            form.addRow(label, field)
+        layout.addLayout(form)
+        note = QLabel("API 인증키는 Windows 사용자 계정으로 암호화되어 이 PC에 저장됩니다.")
+        note.setStyleSheet("color:#526D82;"); layout.addWidget(note)
+        save_button = QPushButton("이카운트 연결정보 저장")
+        save_button.setObjectName("primary"); save_button.clicked.connect(self._save_ecount)
+        layout.addWidget(save_button); layout.addStretch()
+        return tab
+
+    def _save_ecount(self) -> None:
+        config = load_settings()
+        config.update(company_code=self.ec_company.text().strip(), user_id=self.ec_user.text().strip(),
+                      zone=self.ec_zone.text().strip(), employee_code=self.ec_employee.text().strip(),
+                      test_mode=self.ec_test.isChecked())
+        try:
+            save_settings(config)
+            if self.ec_key.text().strip():
+                save_api_key(self.ec_user.text(), self.ec_key.text())
+            self.owner.manager_code.setText(self.ec_employee.text().strip())
+            QMessageBox.information(self, "저장 완료", "이카운트 연결정보를 안전하게 저장했습니다. 로그인 테스트는 전표 입력 화면에서 진행해주세요.")
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", str(exc))
+
+    def _channel_tab(self) -> QWidget:
+        tab = QWidget(); layout = QVBoxLayout(tab)
+        tools = QHBoxLayout()
+        search = QLineEdit(); search.setPlaceholderText("판매처명 또는 거래처코드 검색")
+        add = QPushButton("판매처 추가"); edit = QPushButton("선택 판매처 수정"); delete = QPushButton("선택 판매처 삭제")
+        add.clicked.connect(self._add_channel); edit.clicked.connect(self._edit_channel); delete.clicked.connect(self._delete_channel)
+        tools.addWidget(search, 1); tools.addWidget(add); tools.addWidget(edit); tools.addWidget(delete)
+        layout.addLayout(tools)
+        self.channel_table = QTableWidget(0, 5)
+        self.channel_table.setHorizontalHeaderLabels(["판매처", "이카운트 거래처코드", "거래처명", "그룹", "상태"])
+        self.channel_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.channel_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.channel_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.channel_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.channel_table.doubleClicked.connect(self._edit_channel)
+        search.textChanged.connect(self._filter_channels)
+        layout.addWidget(self.channel_table, 1)
+        self._refresh_channels()
+        price = QPushButton("판매처별 가격 파일 가져오기")
+        price.clicked.connect(self.owner.import_closedmall_prices); layout.addWidget(price)
+        return tab
+
+    def _refresh_channels(self) -> None:
+        self.channel_table.setRowCount(0)
+        rows = getattr(self.owner.catalog, "channel_rows", []) if self.owner.catalog else []
+        for source in sorted(rows, key=lambda value: str(value.get("source_name", ""))):
+            if str(source.get("is_active", True)).lower() in ("false", "0"):
+                continue
+            row = self.channel_table.rowCount(); self.channel_table.insertRow(row)
+            values = (source.get("source_name", ""), source.get("ecount_customer_code", ""),
+                      source.get("ecount_customer_name", ""), source.get("channel_group", ""), "사용")
+            for column, value in enumerate(values): self.channel_table.setItem(row, column, QTableWidgetItem(str(value or "")))
+
+    def _filter_channels(self, keyword: str) -> None:
+        for row in range(self.channel_table.rowCount()):
+            text = " ".join(self.channel_table.item(row, column).text() for column in range(self.channel_table.columnCount()))
+            self.channel_table.setRowHidden(row, not search_text_matches(keyword, text))
+
+    def _channel_editor(self, existing: dict | None = None) -> dict | None:
+        dialog = QDialog(self); dialog.setWindowTitle("판매처 수정" if existing else "판매처 추가")
+        form = QFormLayout(dialog)
+        name = QLineEdit(str((existing or {}).get("source_name", "")))
+        code = QLineEdit(str((existing or {}).get("ecount_customer_code", "")))
+        customer = QLineEdit(str((existing or {}).get("ecount_customer_name", "")))
+        group = QLineEdit(str((existing or {}).get("channel_group", "")))
+        form.addRow("판매처명", name); form.addRow("이카운트 거래처코드", code)
+        form.addRow("거래처명", customer); form.addRow("판매처 그룹", group)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("저장"); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        if not name.text().strip() or not code.text().strip():
+            QMessageBox.warning(self, "필수 정보", "판매처명과 이카운트 거래처코드를 입력해주세요.")
+            return None
+        return {"source_name": name.text().strip(), "normalized_name": normalize_source(name.text()),
+                "ecount_customer_code": code.text().strip(), "ecount_customer_name": customer.text().strip(),
+                "channel_group": group.text().strip(), "is_active": True}
+
+    def _require_channel_db(self) -> bool:
+        if self.owner.supabase_client is None:
+            QMessageBox.information(self, "DB 연결 필요", "판매처 정보는 사용자 전체가 공유하므로 Supabase DB 로그인 후 관리할 수 있습니다.")
+            return False
+        return True
+
+    def _add_channel(self) -> None:
+        if not self._require_channel_db(): return
+        values = self._channel_editor()
+        if values: self._save_channel(values)
+
+    def _edit_channel(self, *_args) -> None:
+        if not self._require_channel_db(): return
+        row = self.channel_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "선택 필요", "수정할 판매처를 선택해주세요."); return
+        old_name = self.channel_table.item(row, 0).text()
+        existing = next((value for value in self.owner.catalog.channel_rows if value.get("source_name") == old_name), {})
+        values = self._channel_editor(existing)
+        if values:
+            if values["source_name"] != old_name:
+                self.owner.supabase_client.table("ecount_sales_channels").upsert({**existing, "source_name": old_name, "is_active": False}, on_conflict="source_name").execute()
+            self._save_channel(values)
+
+    def _save_channel(self, values: dict) -> None:
+        try:
+            self.owner.supabase_client.table("ecount_sales_channels").upsert(values, on_conflict="source_name").execute()
+            self.owner._reload_supabase_catalog(); self._refresh_channels()
+            if self.rule_channel.findText(values["source_name"]) < 0: self.rule_channel.addItem(values["source_name"])
+        except Exception as exc:
+            QMessageBox.critical(self, "판매처 저장 실패", str(exc))
+
+    def _delete_channel(self) -> None:
+        if not self._require_channel_db(): return
+        rows = sorted({index.row() for index in self.channel_table.selectedIndexes()})
+        if not rows:
+            QMessageBox.information(self, "선택 필요", "삭제할 판매처를 선택해주세요."); return
+        selections = [(self.channel_table.item(row, 0).text(), self.channel_table.item(row, 1).text()) for row in rows]
+        if QMessageBox.question(self, "판매처 일괄 삭제", f"선택한 판매처 {len(selections):,}개를 목록에서 삭제할까요?\n기존 전표와 가격 이력은 삭제되지 않습니다.",
+                                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes: return
+        try:
+            for name, customer_code in selections:
+                existing = next((value for value in self.owner.catalog.channel_rows if value.get("source_name") == name), {})
+                self.owner.supabase_client.table("ecount_sales_channels").upsert({**existing, "source_name": name,
+                    "normalized_name": existing.get("normalized_name") or normalize_source(name),
+                    "ecount_customer_code": existing.get("ecount_customer_code") or customer_code,
+                    "is_active": False}, on_conflict="source_name").execute()
+                self.shipping_rules[name] = {"deleted": True}
+            save_shipping_rules(self.shipping_rules); self._refresh_shipping_rules()
+            self.owner._reload_supabase_catalog(); self._refresh_channels()
+        except Exception as exc:
+            QMessageBox.critical(self, "판매처 일괄 삭제 실패", str(exc))
+
+
 class SalesVoucherWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -1303,6 +1627,8 @@ class SalesVoucherWindow(QMainWindow):
         self.db_item_search = QLineEdit()
         self.db_rule_search = QLineEdit()
         self.result_filter_column = QComboBox()
+        self.result_channel_filter = QComboBox()
+        self.result_channel_filter.addItem("전체 판매처")
         self.db_item_filter_column = QComboBox()
         self.db_rule_filter_column = QComboBox()
         self.table_filter_controls: list[tuple[QTableWidget, QComboBox, QLineEdit]] = []
@@ -1356,10 +1682,8 @@ class SalesVoucherWindow(QMainWindow):
         sellmate_button.clicked.connect(self.choose_sellmate_file)
         esm_button = QPushButton("ESM 주문 수집")
         esm_button.clicked.connect(self.choose_esm_orders)
-        price_import_button = QPushButton("판매처별 가격 가져오기")
-        price_import_button.clicked.connect(self.import_closedmall_prices)
-        marketplace_login_button = QPushButton("옥션·지마켓 로그인")
-        marketplace_login_button.clicked.connect(self.open_marketplace_login)
+        marketplace_settings_button = QPushButton("판매처 설정")
+        marketplace_settings_button.clicked.connect(self.open_marketplace_settings)
         analyze_button = QPushButton("분석 및 자동 매칭")
         analyze_button.setObjectName("primary")
         analyze_button.clicked.connect(self.analyze)
@@ -1367,9 +1691,8 @@ class SalesVoucherWindow(QMainWindow):
         options_layout.addWidget(browse_button, 0, 1, 1, 2)
         options_layout.addWidget(sellmate_button, 0, 3, 1, 3)
         options_layout.addWidget(esm_button, 0, 6, 1, 2)
-        options_layout.addWidget(price_import_button, 0, 8, 1, 2)
-        options_layout.addWidget(marketplace_login_button, 0, 10, 1, 2)
-        options_layout.addWidget(self.source_mode_label, 0, 12)
+        options_layout.addWidget(marketplace_settings_button, 0, 8, 1, 2)
+        options_layout.addWidget(self.source_mode_label, 0, 10, 1, 3)
         options_layout.addWidget(QLabel("선택 파일"), 1, 0)
         options_layout.addWidget(self.file_path, 1, 1, 1, 12)
         options_layout.addWidget(QLabel("추가 파일"), 2, 0)
@@ -1432,6 +1755,10 @@ class SalesVoucherWindow(QMainWindow):
         result_layout.setSpacing(5)
         result_search_layout = QHBoxLayout()
         result_search_layout.addWidget(QLabel("결과 검색"))
+        result_search_layout.addWidget(self.result_channel_filter)
+        self.result_channel_filter.currentTextChanged.connect(
+            lambda: self.filter_result_lines(self.result_search.text())
+        )
         self.result_filter_column.addItems(
             ["전체 열", "품목코드", "품목명", "판매처명", "수량", "단가", "금액", "창고", "주문건수", "주문번호"]
         )
@@ -1857,6 +2184,9 @@ class SalesVoucherWindow(QMainWindow):
     def open_marketplace_login(self) -> None:
         MarketplaceLoginDialog(self).exec()
 
+    def open_marketplace_settings(self) -> None:
+        MarketplaceSettingsDialog(self).exec()
+
     def import_closedmall_prices(self) -> None:
         if not self._require_supabase() or self.catalog is None:
             return
@@ -2008,6 +2338,15 @@ class SalesVoucherWindow(QMainWindow):
         self.summary_difference.setStyleSheet(
             "color:#047857;" if result.is_reconciled else "color:#B91C1C;font-weight:700;"
         )
+        selected_channel = self.result_channel_filter.currentText()
+        self.result_channel_filter.blockSignals(True)
+        self.result_channel_filter.clear()
+        self.result_channel_filter.addItem("전체 판매처")
+        self.result_channel_filter.addItems(sorted({line.source_channel for line in result.lines if line.source_channel}))
+        self.result_channel_filter.setCurrentText(
+            selected_channel if self.result_channel_filter.findText(selected_channel) >= 0 else "전체 판매처"
+        )
+        self.result_channel_filter.blockSignals(False)
         self.lines_table.setSortingEnabled(False)
         self.lines_table.setRowCount(len(result.lines))
         for row_index, line in enumerate(result.lines):
@@ -2090,6 +2429,7 @@ class SalesVoucherWindow(QMainWindow):
 
     def filter_result_lines(self, text: str) -> None:
         keyword = (text or "").strip()
+        channel_filter = self.result_channel_filter.currentText()
         selected = self.result_filter_column.currentIndex() - 1
         order_number_filter = selected == self.lines_table.columnCount()
         visible = 0
@@ -2115,11 +2455,13 @@ class SalesVoucherWindow(QMainWindow):
                 )
                 if selected < 0:
                     searchable = f"{searchable} {order_numbers}"
-            show = search_text_matches(keyword, searchable)
+            row_channel = self.lines_table.item(row, 2).text() if self.lines_table.item(row, 2) else ""
+            channel_matches = channel_filter == "전체 판매처" or row_channel == channel_filter
+            show = channel_matches and search_text_matches(keyword, searchable)
             self.lines_table.setRowHidden(row, not show)
             if show:
                 visible += 1
-        if keyword:
+        if keyword or channel_filter != "전체 판매처":
             self.result_filter_count.setText(f"{visible:,}/{self.lines_table.rowCount():,}행")
         else:
             self.result_filter_count.setText(f"전체 {self.lines_table.rowCount():,}행")
@@ -2927,10 +3269,7 @@ class SalesVoucherWindow(QMainWindow):
         order = find_order_for_issue(self.current_result.orders, issue)
         if order is None:
             return
-        existing_mapping = self.catalog.mappings.get(
-            (order.source_channel, order.normalized_source),
-            {},
-        )
+        existing_mapping = self.catalog.mapping_for(order.source_channel, order.normalized_source) or {}
         dialog = SetMappingDialog(
             order,
             self.catalog.items,

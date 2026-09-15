@@ -13,6 +13,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from channel_settings import load_shipping_rules, shipping_rule_for
+
 
 CHANNEL_NAME = "리큐엠_스마트스토어"
 MONEY = Decimal("0.01")
@@ -301,6 +303,7 @@ class ReferenceCatalog:
         for row in self.mapping_component_rows:
             components_by_mapping[str(row.get("mapping_key", ""))].append(row)
         self.mappings: dict[tuple[str, str], dict[str, Any]] = {}
+        mapping_candidates: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self.mapping_rows:
             if not as_bool(row.get("is_active", True)) or row.get("review_status") != "confirmed":
                 continue
@@ -310,6 +313,22 @@ class ReferenceCatalog:
                 key=lambda x: int(x.get("sequence", 0)),
             )
             self.mappings[(str(row.get("source_channel", "")), str(row.get("normalized_source", "")))] = entry
+            mapping_candidates[str(row.get("normalized_source", ""))].append(entry)
+        self.shared_mappings: dict[str, dict[str, Any]] = {}
+        for normalized, candidates in mapping_candidates.items():
+            signatures = {
+                (
+                    str(candidate.get("mapping_type", "")),
+                    tuple(
+                        (str(component.get("item_code", "")), str(as_decimal(component.get("quantity"), Decimal("1"))))
+                        for component in candidate.get("components", [])
+                    ),
+                )
+                for candidate in candidates
+            }
+            # 판매처가 달라도 품목/수량 구성이 하나로 일치할 때만 공통 매칭으로 재사용한다.
+            if normalized and len(signatures) == 1:
+                self.shared_mappings[normalized] = candidates[0]
 
         components_by_rule: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self.price_component_rows:
@@ -334,6 +353,10 @@ class ReferenceCatalog:
                 for lookup_key in lookup_keys:
                     if lookup_key:
                         self.price_templates[(str(row.get("source_channel", "")), lookup_key)].append(entry)
+
+    def mapping_for(self, source_channel: str, normalized_source: str) -> dict[str, Any] | None:
+        """Prefer a channel mapping, then reuse a conflict-free shared product mapping."""
+        return self.mappings.get((source_channel, normalized_source)) or self.shared_mappings.get(normalized_source)
 
     @classmethod
     def from_csv_dir(cls, folder: str | Path) -> "ReferenceCatalog":
@@ -595,6 +618,7 @@ def combine_order_sources(
 def read_sellmate_orders(
     path: str | Path,
     voucher_date: date,
+    shipping_rules: dict[str, dict] | None = None,
 ) -> list[SmartStoreOrder]:
     """셀메이트 이카운트양식 파일을 판매전표 공통 주문 구조로 읽는다."""
     workbook = load_workbook(path, read_only=True, data_only=True)
@@ -628,6 +652,7 @@ def read_sellmate_orders(
         indexes = {name: index for index, name in enumerate(header)}
         paid_at = datetime.combine(voucher_date, datetime.min.time())
         result: list[SmartStoreOrder] = []
+        effective_shipping_rules = shipping_rules if shipping_rules is not None else load_shipping_rules()
         for source_row, row in enumerate(rows, start=header_row + 1):
             if not any(value not in (None, "") for value in row):
                 continue
@@ -643,7 +668,16 @@ def read_sellmate_orders(
                 if "사용자정의10" in indexes
                 else Decimal("0")
             )
-            shipping_total = custom_shipping if custom_shipping > 0 else Decimal("0")
+            shipping_rule = shipping_rule_for(channel, effective_shipping_rules)
+            shipping_source = shipping_rule.get("source", "custom10")
+            if shipping_source == "amount_minus_unit":
+                shipping_total = max(Decimal("0"), amount - option_total)
+            elif shipping_source == "none":
+                shipping_total = Decimal("0")
+            else:
+                shipping_total = custom_shipping if custom_shipping > 0 else Decimal("0")
+                if shipping_total == 0:
+                    shipping_total = as_decimal(shipping_rule.get("default_fee", 0))
             item_total = amount
             normalized_channel = normalize_source(channel)
             if normalized_channel in {
@@ -651,19 +685,18 @@ def read_sellmate_orders(
                 normalize_source("삼성카드 쇼핑몰"),
             } and quantity >= 2:
                 item_total = option_total
-            if normalized_channel == normalize_source("11번가"):
-                embedded_shipping = amount - option_total
-                if embedded_shipping > 0:
-                    shipping_total = embedded_shipping
-                    item_total = option_total
-            elif normalized_channel == normalize_source("오늘의집") and shipping_total > 0:
+            shipping_method = shipping_rule.get("method", "separate")
+            if shipping_method == "subtract" and shipping_total > 0:
                 item_total = amount - shipping_total
                 if item_total < 0:
                     raise ValueError(
-                        f"셀메이트 파일 {source_row}행의 오늘의집 상품금액보다 배송비가 큽니다."
+                        f"셀메이트 파일 {source_row}행의 {channel} 상품금액보다 배송비가 큽니다."
                     )
-                # 오늘의집 배송비는 별도 전표행을 만들지 않고 상품(세트는 본품) 금액에서 차감한다.
                 shipping_total = Decimal("0")
+            elif shipping_method in ("included", "exclude"):
+                shipping_total = Decimal("0")
+            elif shipping_source == "amount_minus_unit" and shipping_total > 0:
+                item_total = option_total
             result.append(
                 SmartStoreOrder(
                     source_row=source_row,
@@ -719,7 +752,7 @@ def convert_orders(
         if any(word in order.status for word in ("취소", "반품", "교환")):
             issues.append(_issue(order, f"주문상태 확인 필요: {order.status}"))
             continue
-        mapping = catalog.mappings.get((order_channel, order.normalized_source))
+        mapping = catalog.mapping_for(order_channel, order.normalized_source)
         if not mapping:
             reason = "상품/옵션 조합이 DB에 없습니다."
             issues.append(_issue(order, reason))

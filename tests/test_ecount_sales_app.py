@@ -7,9 +7,9 @@ from decimal import Decimal
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QTabWidget
 
-from ecount_sales_app import ItemOrderDetailsDialog, SalesVoucherWindow, split_voucher_line_total
+from ecount_sales_app import ItemOrderDetailsDialog, MarketplaceSettingsDialog, SalesVoucherWindow, split_voucher_line_total
 from ecount_sales_api_dialog import EcountSalesApiDialog
 from ecount_sales_core import ConversionResult, ItemOrderDetail, SmartStoreOrder, VoucherLine
 
@@ -85,6 +85,23 @@ class SalesAppEditTests(unittest.TestCase):
         self.assertEqual({line.warehouse for line in window.current_result.lines}, {"100"})
         window.close()
 
+    def test_result_can_be_filtered_by_sales_channel(self) -> None:
+        result = ConversionResult(orders=[], lines=[
+            VoucherLine("A", "", "ITEM-A", "품목A", Decimal("1"), Decimal("100"), "300", source_channel="오늘의집"),
+            VoucherLine("B", "", "ITEM-B", "품목B", Decimal("1"), Decimal("200"), "300", source_channel="11번가"),
+        ], issues=[])
+        window = SalesVoucherWindow()
+        window.current_result = result
+        window._show_result(result)
+        window.result_channel_filter.setCurrentText("오늘의집")
+        visibility = {
+            window.lines_table.item(row, 2).text(): not window.lines_table.isRowHidden(row)
+            for row in range(window.lines_table.rowCount())
+        }
+        self.assertTrue(visibility["오늘의집"])
+        self.assertFalse(visibility["11번가"])
+        window.close()
+
     def test_api_preview_shows_source_channel(self) -> None:
         line = VoucherLine(
             "CUST", "", "ITEM", "품목", Decimal("1"), Decimal("1000"), "300",
@@ -99,6 +116,18 @@ class SalesAppEditTests(unittest.TestCase):
         self.assertEqual(dialog.table.horizontalHeaderItem(5).text(), "품목명")
         self.assertEqual(dialog.table.item(0, 5).text(), "품목")
         dialog.close()
+
+    def test_marketplace_settings_groups_configuration_tabs(self) -> None:
+        window = SalesVoucherWindow()
+        dialog = MarketplaceSettingsDialog(window)
+        tabs = dialog.findChild(QTabWidget)
+        self.assertEqual([tabs.tabText(index) for index in range(tabs.count())],
+                         ["배송비 규칙", "로그인·수집", "이카운트 연결", "판매처 기본정보"])
+        self.assertEqual(dialog.SOURCE_LABELS["custom10"], "셀메이트 기준")
+        self.assertEqual(dialog.rule_table.selectionMode(), QAbstractItemView.ExtendedSelection)
+        self.assertEqual(dialog.channel_table.selectionMode(), QAbstractItemView.ExtendedSelection)
+        dialog.close()
+        window.close()
 
 
 if __name__ == "__main__":

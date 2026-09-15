@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from esm_orders import EsmSession, STATUSES, channel_for, read_esm, merge_orders, export_summary
-from esm_browser import browser_channels, date_windows
+from esm_orders import EsmSession, STATUSES, channel_for, read_esm, merge_orders, export_summary, export_esm_original_format
+from esm_browser import browser_channels, date_windows, installed_browser, is_logged_in_url
 from ecount_sales_core import ReferenceCatalog, convert_orders
 
 
@@ -39,6 +39,22 @@ def test_read_real_format_numeric_strings_and_reordered_headers(tmp_path):
 
 def test_esm_browser_prefers_chrome_before_edge():
     assert browser_channels() == ("chrome", "msedge")
+
+
+def test_installed_browser_selects_chrome_when_available(monkeypatch, tmp_path):
+    chrome = tmp_path / "chrome.exe"
+    chrome.write_bytes(b"")
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+    monkeypatch.setenv("PROGRAMFILES(X86)", str(tmp_path / "missing"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "missing"))
+    monkeypatch.setattr("esm_browser.shutil.which", lambda name: str(chrome) if name == "chrome" else None)
+    assert installed_browser() == ("chrome", str(chrome))
+
+
+def test_esm_login_url_detection():
+    assert is_logged_in_url("https://www.esmplus.com/Home/Home")
+    assert is_logged_in_url("https://www.esmplus.com/Escrow/SmartDelivery/test")
+    assert not is_logged_in_url("https://signin.esmplus.com/login")
 
 
 @pytest.mark.parametrize("quantity,coupon", [(0, 0), ("", 0), ("nan", 0), (1.5, 0), (1, ""), (1, "bad"), (1, 999999), (1, -1)])
@@ -84,6 +100,11 @@ def test_archive_exact_bytes_complete_gate_export_and_reopen(tmp_path):
     assert summary.worksheets[0]["E2"].value == 214500
     assert summary.worksheets[0]["A1"].fill.fgColor.rgb.endswith("FFCC00")
     summary.close()
+    raw_merged = load_workbook(session.folder / "ESM_원본양식_통합.xlsx")
+    assert raw_merged.active["A3"].value == "00001"
+    assert raw_merged.active["B3"].value == "G(test)"
+    assert raw_merged.active.max_column == 10
+    raw_merged.close()
     output = tmp_path / "raw.zip"
     session.export_zip(output)
     with zipfile.ZipFile(output) as z:
@@ -111,6 +132,23 @@ def test_different_download_status_rejected(tmp_path):
     session = EsmSession.create(tmp_path / "archive", "주문일", date(2026, 9, 9), date(2026, 9, 9))
     with pytest.raises(ValueError, match="다른 상태"):
         session.archive(source, "배송준비", 1)
+
+
+def test_original_format_merge_keeps_full_header_and_deduplicates(tmp_path):
+    source = fixture_file(tmp_path / "source.xlsx")
+    session = EsmSession.create(tmp_path / "archive", "주문일", date(2026, 9, 9), date(2026, 9, 9), "파일 가져오기")
+    session.archive(source, "가져온원본1")
+    session.archive(source, "가져온원본2")
+    session.finish()
+    destination = tmp_path / "merged.xlsx"
+    export_esm_original_format(session, destination)
+    book = load_workbook(destination)
+    sheet = book.active
+    assert sheet.max_row == 3
+    assert sheet[2][0].value == "주문번호*"
+    assert sheet[3][0].value == "00001"
+    assert sheet.max_column == 10
+    book.close()
 
 
 def test_snapshot_folders_unique_and_period_split():

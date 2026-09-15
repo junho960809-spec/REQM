@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from esm_browser import EsmBrowserWorker
-from esm_orders import DATE_TYPES, HEADERS, STATUSES, EsmSession, export_summary
+from esm_orders import DATE_TYPES, HEADERS, STATUSES, EsmSession, export_esm_original_format
 
 
 class EsmHeader(QHeaderView):
@@ -103,7 +103,7 @@ class EsmSourceDialog(QDialog):
         self.open_button.clicked.connect(self.open_originals)
         self.zip_button = QPushButton("원본 전체 ZIP 저장")
         self.zip_button.clicked.connect(self.save_zip)
-        self.excel_button = QPushButton("취합 Excel 저장")
+        self.excel_button = QPushButton("ESM 원본양식 통합 저장")
         self.excel_button.clicked.connect(self.save_excel)
         self.import_button = QPushButton("판매전표로 가져오기")
         self.import_button.clicked.connect(self.use_orders)
@@ -253,11 +253,11 @@ class EsmSourceDialog(QDialog):
                 self.failure(str(exc))
 
     def save_excel(self):
-        filename, _ = QFileDialog.getSaveFileName(self, "ESM 취합 Excel 저장", "ESM_취합.xlsx", "Excel (*.xlsx)")
+        filename, _ = QFileDialog.getSaveFileName(self, "ESM 원본양식 통합 저장", "ESM_원본양식_통합.xlsx", "Excel (*.xlsx)")
         if filename:
             try:
-                export_summary(self.session, Path(filename))
-                self.progress.setText(f"취합 Excel 저장 완료: {filename}")
+                export_esm_original_format(self.session, Path(filename))
+                self.progress.setText(f"ESM 원본양식 통합 저장 완료: {filename}")
             except Exception as exc:
                 self.failure(str(exc))
 

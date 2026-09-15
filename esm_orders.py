@@ -7,6 +7,7 @@ import re
 import shutil
 import uuid
 import zipfile
+from copy import copy
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -21,6 +22,7 @@ from ecount_sales_core import SmartStoreOrder, clean_identifier, parse_excel_dat
 STATUSES = ("입금대기", "배송대기", "배송준비", "배송중", "배송완료", "미수령신고", "정산예정", "정산완료")
 DATE_TYPES = ("주문일", "결제완료일", "발송예정일", "발송일", "배송완료일", "정산완료일", "재배송일")
 HEADERS = ("아이디", "상품명", "수량", "주문옵션", "판매금액", "판매자쿠폰할인", "개당 금액")
+ESM_REQUIRED_HEADERS = {"아이디", "주문번호", "상품명", "수량", "주문옵션", "판매금액", "판매자쿠폰할인", "배송상태"}
 
 
 def decimal_value(value, label: str) -> Decimal:
@@ -101,7 +103,7 @@ def read_esm(path: Path | str) -> list[EsmOrder]:
                 book.close()
     else:
         raise ValueError(f"{path.name}: XLS/XLSX 원본이 아닙니다. 로그인 페이지 또는 다운로드 오류인지 확인해주세요.")
-    required = set(HEADERS[:6]) | {"주문번호", "배송상태"}
+    required = ESM_REQUIRED_HEADERS
     indexes = None
     for i, row in enumerate(rows[:30]):
         names = [str(v or "").strip().rstrip("*").strip() for v in row]
@@ -141,6 +143,33 @@ def read_esm(path: Path | str) -> list[EsmOrder]:
         except ValueError as exc:
             raise ValueError(f"{path.name} {number}행: {exc}") from None
     return result
+
+
+def raw_esm_rows(path: Path | str) -> tuple[list[list], int]:
+    """Return every original ESM row and the zero-based header row index."""
+    path = Path(path)
+    signature = path.read_bytes()[:8]
+    if signature.startswith(b"\xd0\xcf\x11\xe0"):
+        book = xlrd.open_workbook(str(path))
+        try:
+            sheet = book.sheet_by_index(0)
+            rows = [sheet.row_values(i) for i in range(sheet.nrows)]
+        finally:
+            book.release_resources()
+    elif signature.startswith(b"PK"):
+        with path.open("rb") as stream:
+            book = load_workbook(stream, read_only=True, data_only=False)
+            try:
+                rows = [list(row) for row in book.worksheets[0].values]
+            finally:
+                book.close()
+    else:
+        raise ValueError(f"{path.name}: XLS/XLSX 원본이 아닙니다.")
+    for index, row in enumerate(rows[:30]):
+        names = {str(value or "").strip().rstrip("*").strip() for value in row}
+        if ESM_REQUIRED_HEADERS.issubset(names):
+            return rows, index
+    raise ValueError(f"{path.name}: ESM 원본 제목행을 찾지 못했습니다.")
 
 
 def merge_orders(groups: list[list[EsmOrder]]) -> tuple[list[EsmOrder], int]:
@@ -240,6 +269,8 @@ class EsmSession:
         self.manifest.update(state="완료", order_count=len(orders), duplicate_count=duplicates)
         self.save()
         export_summary(self, self.folder / "ESM_취합.xlsx")
+        if self.manifest["files"]:
+            export_esm_original_format(self, self.folder / "ESM_원본양식_통합.xlsx")
         return orders
 
     def export_zip(self, destination: Path):
@@ -303,5 +334,67 @@ def export_summary(session: EsmSession, destination: Path):
             put_text(audit.cell(r, c), value)
     for col in "ABCDE":
         audit.column_dimensions[col].width = 30
+    book.save(destination)
+    book.close()
+
+
+def export_esm_original_format(session: EsmSession, destination: Path):
+    """Merge downloaded files into one workbook while retaining the ESM column layout.
+
+    XLSX sources retain the first file's worksheet layout and cell styles. Legacy XLS
+    sources retain the original preamble, complete column order and values in XLSX form.
+    """
+    if session.manifest["state"] != "완료":
+        raise ValueError("수집 완료 후 ESM 원본 양식 통합 파일을 저장할 수 있습니다.")
+    if not session.manifest["files"]:
+        raise ValueError("통합할 ESM 원본 파일이 없습니다.")
+    orders, _ = session.orders()
+    selected = {(order.source_file, order.source_row) for order in orders}
+    sources = [(session.folder / entry["file"]).resolve() for entry in session.manifest["files"]]
+    first_rows, first_header = raw_esm_rows(sources[0])
+    first_is_xlsx = sources[0].read_bytes()[:2] == b"PK"
+    if first_is_xlsx:
+        book = load_workbook(sources[0])
+        sheet = book.worksheets[0]
+        data_start = first_header + 2  # one-based first data row
+        style_row = data_start if sheet.max_row >= data_start else first_header + 1
+        styles = []
+        for cell in sheet[style_row]:
+            styles.append((copy(cell._style), copy(cell.number_format), copy(cell.alignment), copy(cell.protection)))
+        if sheet.max_row >= data_start:
+            sheet.delete_rows(data_start, sheet.max_row - data_start + 1)
+    else:
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "ESM 주문"
+        for row in first_rows[:first_header + 1]:
+            sheet.append(row)
+        data_start = first_header + 2
+        styles = []
+        for cell in sheet[first_header + 1]:
+            cell.fill = PatternFill("solid", fgColor="FFCC00")
+            cell.font = Font(name="맑은 고딕", bold=True)
+
+    output_row = data_start
+    for source in sources:
+        rows, header = raw_esm_rows(source)
+        if [str(v or "").strip() for v in rows[header]] != [str(v or "").strip() for v in first_rows[first_header]]:
+            book.close()
+            raise ValueError(f"{source.name}: 다른 ESM 열 구조가 포함되어 통합할 수 없습니다.")
+        for source_row, values in enumerate(rows[header + 1:], start=header + 2):
+            if (source.name, source_row) not in selected:
+                continue
+            for column, value in enumerate(values, 1):
+                cell = sheet.cell(output_row, column, value)
+                if column <= len(styles):
+                    cell._style = copy(styles[column - 1][0])
+                    cell.number_format = copy(styles[column - 1][1])
+                    cell.alignment = copy(styles[column - 1][2])
+                    cell.protection = copy(styles[column - 1][3])
+            output_row += 1
+    destination = Path(destination)
+    if destination.resolve().is_relative_to((session.folder / "원본").resolve()):
+        book.close()
+        raise ValueError("원본 폴더에는 통합 결과를 덮어쓸 수 없습니다.")
     book.save(destination)
     book.close()

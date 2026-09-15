@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import queue
 import re
+import os
+import shutil
 import tempfile
 import threading
 import time
@@ -24,6 +26,26 @@ def browser_channels() -> tuple[str, str]:
     return "chrome", "msedge"
 
 
+def installed_browser() -> tuple[str, str]:
+    """Return Chrome when installed; Edge is used only when Chrome is absent."""
+    chrome_paths = (
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    )
+    chrome = shutil.which("chrome") or next((str(path) for path in chrome_paths if path.is_file()), "")
+    if chrome:
+        return "chrome", chrome
+    edge_paths = (
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Microsoft/Edge/Application/msedge.exe",
+        Path(os.environ.get("PROGRAMFILES", "")) / "Microsoft/Edge/Application/msedge.exe",
+    )
+    edge = shutil.which("msedge") or next((str(path) for path in edge_paths if path.is_file()), "")
+    if edge:
+        return "msedge", edge
+    raise ValueError("Google Chrome 또는 Microsoft Edge가 설치되어 있지 않습니다.")
+
+
 def date_windows(start: date, end: date):
     while start <= end:
         stop = min(start + timedelta(days=30), end)
@@ -42,6 +64,11 @@ def set_calendar(page, selector: str, value: date):
     calendar.get_by_role("link", name=str(value.day), exact=True).click()
     if field.input_value() != value.isoformat():
         raise ValueError("ESM 조회 날짜가 적용되지 않았습니다.")
+
+
+def is_logged_in_url(url_value: str) -> bool:
+    url = urlparse(url_value)
+    return url.hostname == "www.esmplus.com" and url.path.startswith(("/Home", "/Escrow"))
 
 
 class EsmBrowserWorker(QThread):
@@ -76,45 +103,56 @@ class EsmBrowserWorker(QThread):
         from playwright.sync_api import sync_playwright
         try:
             with sync_playwright() as pw:
-                context = None
-                selected_channel = ""
-                for channel in browser_channels():
-                    try:
-                        profile = ESM_PROFILE_ROOT / channel
-                        profile.mkdir(parents=True, exist_ok=True)
-                        context = pw.chromium.launch_persistent_context(
-                            str(profile), channel=channel, headless=False, accept_downloads=True,
-                        )
-                        selected_channel = channel
-                        break
-                    except Exception:
-                        continue
-                if context is None:
-                    raise ValueError("Microsoft Edge 또는 Google Chrome을 설치한 후 다시 실행해주세요.")
-                pages = context.pages
-                page = pages[0] if pages else context.new_page()
-                page.set_default_timeout(15000)
-                page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                selected_channel, executable = installed_browser()
+                profile = ESM_PROFILE_ROOT / selected_channel
+                profile.mkdir(parents=True, exist_ok=True)
                 browser_label = "Chrome" if selected_channel == "chrome" else "Edge"
-                self.status_changed.emit(
-                    f"{browser_label}에서 ESM 로그인을 확인해주세요. 로그인 세션은 이 PC에서 재사용됩니다."
-                )
-                previous = False
+                def launch(headless):
+                    try:
+                        result = pw.chromium.launch_persistent_context(
+                            str(profile), executable_path=executable, headless=headless, accept_downloads=True,
+                        )
+                    except Exception as exc:
+                        raise ValueError(
+                            f"{browser_label}을 열지 못했습니다. 실행 중인 ESM 로그인 창을 모두 닫고 다시 시도해주세요."
+                        ) from exc
+                    active = result.pages[0] if result.pages else result.new_page()
+                    active.set_default_timeout(15000)
+                    return result, active
+
+                # 저장된 로그인 세션은 먼저 보이지 않는 브라우저에서 확인한다.
+                context, page = launch(True)
+                page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                if not is_logged_in_url(page.url):
+                    context.close()
+                    context, page = launch(False)
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+                    self.status_changed.emit(
+                        f"{browser_label}에서 ESM 로그인을 완료해주세요. 로그인 후 수집 화면은 자동으로 백그라운드 전환됩니다."
+                    )
+                    while not self.stopping.is_set() and not page.is_closed() and not is_logged_in_url(page.url):
+                        page.wait_for_timeout(250)
+                    if self.stopping.is_set() or page.is_closed():
+                        context.close()
+                        return
+                    # 쿠키가 프로필에 저장된 뒤 표시 브라우저를 닫고 headless로 다시 연다.
+                    context.close()
+                    context, page = launch(True)
+                    page.goto(ORDERS_URL, wait_until="domcontentloaded")
+                    if not is_logged_in_url(page.url):
+                        raise ValueError("ESM 로그인 세션을 백그라운드 브라우저로 전환하지 못했습니다. 다시 로그인해주세요.")
+                self.ready.emit(True)
+                self.status_changed.emit("ESM 로그인 세션 확인 · 이후 조회와 다운로드는 백그라운드에서 실행됩니다.")
                 while not self.stopping.is_set():
                     if page.is_closed():
                         break
-                    url = urlparse(page.url)
-                    logged_in = url.hostname == "www.esmplus.com" and url.path.startswith(("/Home", "/Escrow"))
-                    if logged_in != previous:
-                        previous = logged_in
-                        self.ready.emit(logged_in)
-                        self.status_changed.emit("ESM 로그인 확인 · 조회 기간을 선택하고 수집을 시작하세요." if logged_in else "ESM 로그인이 필요합니다.")
                     try:
                         request = self.commands.get_nowait()
                     except queue.Empty:
                         page.wait_for_timeout(250)
                         continue
-                    if not logged_in:
+                    if not is_logged_in_url(page.url):
+                        self.ready.emit(False)
                         self.failed.emit("ESM 로그인 후 수집을 시작해주세요.")
                         self.collecting_changed.emit(False)
                         continue

@@ -25,6 +25,39 @@ from ecount_sales_core import (
 
 
 class SalesCoreTests(unittest.TestCase):
+    def test_product_mapping_is_reused_across_channels_when_components_match(self) -> None:
+        catalog = ReferenceCatalog(
+            items=[{"item_code": "ITEM-A", "representative_name": "품목A"}],
+            channels=[
+                {"source_name": "판매처A", "ecount_customer_code": "C-A", "is_active": True},
+                {"source_name": "판매처B", "ecount_customer_code": "C-B", "is_active": True},
+            ],
+            mappings=[{"mapping_key": "MAP-A", "source_channel": "판매처A", "normalized_source": "공통상품블랙",
+                       "mapping_type": "single", "review_status": "confirmed", "is_active": True}],
+            mapping_components=[{"mapping_key": "MAP-A", "sequence": 1, "item_code": "ITEM-A", "quantity": 1}],
+            price_rules=[], price_components=[],
+        )
+        order = SmartStoreOrder(2, "ORDER-B", "PRODUCT-B", datetime(2026, 9, 15), "", "공통상품", "블랙",
+                                Decimal("1"), Decimal("26900"), source_channel="판매처B")
+        result = convert_orders([order], catalog)
+        self.assertFalse(result.issues)
+        self.assertEqual(result.lines[0].customer_code, "C-B")
+        self.assertEqual(result.lines[0].item_code, "ITEM-A")
+
+    def test_conflicting_channel_mappings_are_not_reused(self) -> None:
+        catalog = ReferenceCatalog(
+            items=[{"item_code": "ITEM-A"}, {"item_code": "ITEM-B"}], channels=[],
+            mappings=[
+                {"mapping_key": "A", "source_channel": "판매처A", "normalized_source": "같은상품", "mapping_type": "single", "review_status": "confirmed", "is_active": True},
+                {"mapping_key": "B", "source_channel": "판매처B", "normalized_source": "같은상품", "mapping_type": "single", "review_status": "confirmed", "is_active": True},
+            ],
+            mapping_components=[
+                {"mapping_key": "A", "sequence": 1, "item_code": "ITEM-A", "quantity": 1},
+                {"mapping_key": "B", "sequence": 1, "item_code": "ITEM-B", "quantity": 1},
+            ], price_rules=[], price_components=[],
+        )
+        self.assertIsNone(catalog.mapping_for("판매처C", "같은상품"))
+
     def setUp(self) -> None:
         self.catalog = ReferenceCatalog(
             items=[
@@ -496,6 +529,22 @@ class SalesCoreTests(unittest.TestCase):
             orders = read_sellmate_orders(source, date(2026, 9, 8))
 
             self.assertEqual(orders[0].item_total, Decimal("29900.00"))
+            self.assertEqual(orders[0].shipping_total, Decimal("0.00"))
+
+    def test_sellmate_uses_saved_channel_shipping_method(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "custom_shipping.xlsx"
+            from openpyxl import Workbook
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["판매처명", "수량", "옵션판매단가", "금액", "판매처주문번호", "수령자",
+                          "옵션상품명", "상품옵션", "사용자정의10", "재고매칭(1)옵션내용"])
+            sheet.append(["테스트몰", 1, 30000, 33000, "ORDER-1", "구매자", "상품", "옵션", 3000, "상품 옵션"])
+            workbook.save(source)
+            workbook.close()
+            rules = {"테스트몰": {"method": "subtract", "source": "custom10", "default_fee": 0, "active": True}}
+            orders = read_sellmate_orders(source, date(2026, 9, 8), rules)
+            self.assertEqual(orders[0].item_total, Decimal("30000.00"))
             self.assertEqual(orders[0].shipping_total, Decimal("0.00"))
 
     def test_sellmate_samsung_card_uses_unit_price_times_quantity(self) -> None:
