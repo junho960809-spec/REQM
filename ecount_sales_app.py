@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sys
+import traceback
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
@@ -184,6 +185,24 @@ def write_db_log(message: str) -> None:
             log.write(f"[{timestamp}] {message}\n")
     except Exception:
         pass
+
+
+def apply_login_catalog(window: "SalesVoucherWindow", client: object, catalog: object) -> None:
+    """Apply authenticated data only after the main window is already visible."""
+    try:
+        write_db_log("메인 화면 표시 후 Supabase DB 적용 시작")
+        window._on_db_connected(client, catalog)
+        write_db_log("로그인 화면에서 메인 화면으로 전환 완료")
+    except Exception as exc:
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        write_db_log(f"메인 화면 초기화 실패: {detail}")
+        QMessageBox.critical(
+            window,
+            "프로그램 초기화 오류",
+            "로그인은 완료됐지만 최신 DB를 화면에 적용하지 못했습니다.\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "프로그램 폴더의 db_connection.log를 확인해주세요.",
+        )
 
 
 def load_config() -> dict[str, str]:
@@ -3712,9 +3731,13 @@ def main() -> int:
     if login.exec() != QDialog.Accepted:
         window.close()
         return 0
-    window._on_db_connected(login.client, login.catalog)
+    client, catalog = login.client, login.catalog
     window.show()
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
     app.setQuitOnLastWindowClosed(True)
+    QTimer.singleShot(0, lambda: apply_login_catalog(window, client, catalog))
     return app.exec()
 
 
