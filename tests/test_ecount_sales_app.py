@@ -64,20 +64,20 @@ class SalesAppEditTests(unittest.TestCase):
 
         class FakeWindow:
             def show(self): events.append("show")
-            def showNormal(self): events.append("show_normal")
-            def raise_(self): events.append("raise")
-            def activateWindow(self): events.append("activate")
 
         class FakeLogin:
             client = object()
             catalog = object()
 
-        with patch("ecount_sales_app.QTimer.singleShot") as single_shot:
+        with patch("ecount_sales_app.QTimer.singleShot") as single_shot, patch(
+            "ecount_sales_app.reveal_main_window", side_effect=lambda window: events.append("reveal")
+        ):
             show_authenticated_window(FakeApp(), FakeWindow(), FakeLogin())
 
-        self.assertEqual(events[:2], ["show", "show_normal"])
+        self.assertEqual(events[0], "show")
+        self.assertIn("reveal", events)
         self.assertIn(("quit_on_close", True), events)
-        single_shot.assert_called_once()
+        self.assertEqual(single_shot.call_count, 2)
 
     def test_order_detail_dialog_applies_amount_and_warehouse_by_buyer(self) -> None:
         detail = ItemOrderDetail(

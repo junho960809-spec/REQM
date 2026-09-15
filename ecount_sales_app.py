@@ -205,6 +205,24 @@ def apply_login_catalog(window: "SalesVoucherWindow", client: object, catalog: o
         )
 
 
+def reveal_main_window(window: "SalesVoucherWindow") -> None:
+    """Restore the main window onto the visible desktop and bring it forward."""
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        frame = window.frameGeometry()
+        frame.moveCenter(available.center())
+        window.move(frame.topLeft())
+    window.setWindowState((window.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+    write_db_log(
+        f"메인 화면 표시 위치: x={window.x()}, y={window.y()}, "
+        f"width={window.width()}, height={window.height()}"
+    )
+
+
 def show_authenticated_window(
     app: QApplication,
     window: "SalesVoucherWindow",
@@ -214,11 +232,12 @@ def show_authenticated_window(
     client, catalog = login.client, login.catalog
     write_db_log("로그인 승인 신호 수신 · 메인 화면 표시")
     window.show()
-    window.showNormal()
-    window.raise_()
-    window.activateWindow()
+    reveal_main_window(window)
     app.setQuitOnLastWindowClosed(True)
     QTimer.singleShot(0, lambda: apply_login_catalog(window, client, catalog))
+    # 로그인 창이 실제로 사라진 다음 한 번 더 복원해 Windows의 전면 창 제한이나
+    # 이전 다중 모니터 좌표 때문에 뒤쪽/화면 밖에 남는 경우를 방지한다.
+    QTimer.singleShot(350, lambda: reveal_main_window(window))
 
 
 def load_config() -> dict[str, str]:
