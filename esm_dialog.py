@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from PySide6.QtCore import Qt, QStandardPaths, QUrl
 from PySide6.QtGui import QColor, QDesktopServices
@@ -139,6 +140,7 @@ class EsmSourceDialog(QDialog):
         self.worker.session_started.connect(self.new_session)
         self.worker.collected.connect(self.show_session)
         self.worker.failed.connect(self.failure)
+        self.worker.attention_required.connect(self.login_attention)
         self.worker.collecting_changed.connect(self.set_busy)
         self.worker.finished.connect(self.browser_finished)
         self.worker.start()
@@ -202,11 +204,26 @@ class EsmSourceDialog(QDialog):
         )
         self.refresh_buttons()
 
+    @staticmethod
+    def error_title(message):
+        match = re.match(r"\[ESM-[A-Z_]+\]\s*([^\n]+)", str(message))
+        return match.group(1) if match else "ESM 확인 필요"
+
+    @staticmethod
+    def clean_error_message(message):
+        return re.sub(r"^\[ESM-[A-Z_]+\]\s*", "", str(message), count=1)
+
+    def login_attention(self, message):
+        clean = self.clean_error_message(message)
+        self.progress.setText(clean)
+        QMessageBox.warning(self, self.error_title(message), clean)
+
     def failure(self, message):
-        self.progress.setText(message)
+        clean = self.clean_error_message(message)
+        self.progress.setText(clean)
         self.refresh_buttons()
         if self.pending_result is None:
-            QMessageBox.warning(self, "ESM 확인 필요", message)
+            QMessageBox.warning(self, self.error_title(message), clean)
 
     def choose_folder(self):
         selected = QFileDialog.getExistingDirectory(self, "원본 보관 위치", self.root_path.text())

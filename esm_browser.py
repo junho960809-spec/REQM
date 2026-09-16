@@ -20,6 +20,86 @@ LOGIN_URL = "https://signin.esmplus.com/login"
 ORDERS_URL = "https://www.esmplus.com/Escrow/SmartDelivery/SmartDeliveryRequestManagement?menuCode=TDM366"
 ESM_PROFILE_ROOT = Path.home() / ".reqm" / "esm-browser"
 
+ERROR_GUIDES = {
+    "BROWSER_START": (
+        "Chrome 실행 오류",
+        "Chrome을 시작하지 못했습니다. 실행 중인 ESM Chrome 창을 닫고 다시 시도하거나 PC를 재부팅해주세요.",
+    ),
+    "BROWSER_NOT_FOUND": (
+        "Chrome 설치 확인",
+        "Google Chrome을 찾지 못했습니다. Chrome을 설치하거나 설치 경로를 확인해주세요.",
+    ),
+    "PROFILE_LOCKED": (
+        "ESM 전용 Chrome 사용 중",
+        "ESM 로그인용 Chrome이 이미 실행 중입니다. 기존 ESM Chrome 창을 모두 닫고 다시 시도해주세요.",
+    ),
+    "NETWORK": (
+        "ESM 네트워크 연결 오류",
+        "ESM 로그인 페이지에 연결하지 못했습니다. 인터넷·VPN·방화벽 상태를 확인한 뒤 다시 시도해주세요.",
+    ),
+    "LOGIN_CREDENTIALS": (
+        "ESM 아이디·비밀번호 확인",
+        "아이디 또는 비밀번호가 맞지 않습니다. 최근 비밀번호를 변경했다면 새 비밀번호로 직접 로그인해주세요.",
+    ),
+    "ACCOUNT_RESTRICTED": (
+        "ESM 계정 상태 확인",
+        "로그인 제한·휴면·계정 잠금 상태일 수 있습니다. ESM 안내에 따라 본인인증 또는 계정 복구를 완료해주세요.",
+    ),
+    "LOGIN_DELAYED": (
+        "ESM 로그인이 완료되지 않음",
+        "Chrome 로그인 화면이 계속 열려 있습니다. 비밀번호 변경, 추가 인증, 보안 문자 또는 계정 안내를 확인해주세요.",
+    ),
+    "SESSION_EXPIRED": (
+        "ESM 로그인 세션 만료",
+        "저장된 로그인 세션이 만료됐습니다. ESM 로그인을 다시 완료한 뒤 수집을 시작해주세요.",
+    ),
+    "SCREEN_CHANGED": (
+        "ESM 화면 확인 필요",
+        "ESM 화면 구조가 변경됐거나 조회 요소를 찾지 못했습니다. 열린 화면과 공지사항을 확인해주세요.",
+    ),
+    "DOWNLOAD": (
+        "ESM 다운로드 확인 필요",
+        "엑셀 다운로드가 완료되지 않았습니다. 개인정보 다운로드 안내창과 브라우저 다운로드 권한을 확인해주세요.",
+    ),
+}
+
+
+def user_error(code: str, detail: str = "") -> str:
+    title, guide = ERROR_GUIDES[code]
+    suffix = f"\n\n상세: {detail}" if detail else ""
+    return f"[ESM-{code}] {title}\n{guide}{suffix}"
+
+
+def classify_browser_error(exc: Exception, stage: str = "browser") -> str:
+    detail = str(exc)
+    lowered = detail.casefold()
+    if any(word in lowered for word in ("processsingleton", "user data directory is already in use", "profile in use")):
+        return user_error("PROFILE_LOCKED")
+    if any(word in lowered for word in ("err_name_not_resolved", "err_connection", "err_internet_disconnected", "timed out", "timeout")):
+        return user_error("NETWORK")
+    if stage == "download":
+        return user_error("DOWNLOAD")
+    if stage in ("collect", "screen"):
+        return user_error("SCREEN_CHANGED")
+    return user_error("BROWSER_START")
+
+
+def detect_login_issue(body_text: str) -> str | None:
+    compact = " ".join(str(body_text or "").split())
+    credential_phrases = (
+        "아이디 또는 비밀번호가 일치하지", "아이디나 비밀번호가 일치하지",
+        "비밀번호가 올바르지", "로그인 정보를 다시 확인",
+    )
+    restricted_phrases = (
+        "계정이 잠", "로그인이 제한", "휴면 계정", "본인인증이 필요",
+        "비정상적인 로그인", "로그인 실패 횟수",
+    )
+    if any(phrase in compact for phrase in credential_phrases):
+        return user_error("LOGIN_CREDENTIALS")
+    if any(phrase in compact for phrase in restricted_phrases):
+        return user_error("ACCOUNT_RESTRICTED")
+    return None
+
 
 def browser_channels() -> tuple[str, str]:
     """Use Chrome first and keep Edge only as the compatibility fallback."""
@@ -94,6 +174,7 @@ class EsmBrowserWorker(QThread):
     session_started = Signal(object)
     collected = Signal(object)
     failed = Signal(str)
+    attention_required = Signal(str)
     collecting_changed = Signal(bool)
 
     def __init__(self, parent=None):
@@ -130,9 +211,7 @@ class EsmBrowserWorker(QThread):
                             str(profile), executable_path=executable, headless=headless, accept_downloads=True,
                         )
                     except Exception as exc:
-                        raise ValueError(
-                            f"{browser_label}을 열지 못했습니다. 실행 중인 ESM 로그인 창을 모두 닫고 다시 시도해주세요."
-                        ) from exc
+                        raise ValueError(classify_browser_error(exc)) from exc
                     active = result.pages[0] if result.pages else result.new_page()
                     active.set_default_timeout(15000)
                     return result, active
@@ -147,7 +226,21 @@ class EsmBrowserWorker(QThread):
                     self.status_changed.emit(
                         f"{browser_label}에서 ESM 로그인을 완료해주세요. 로그인 후 수집 화면은 자동으로 백그라운드 전환됩니다."
                     )
+                    login_started = time.monotonic()
+                    delayed_notice_sent = False
+                    detected_notice = None
                     while not self.stopping.is_set() and not page.is_closed() and not is_logged_in_url(page.url):
+                        if int((time.monotonic() - login_started) * 4) % 4 == 0:
+                            try:
+                                issue = detect_login_issue(page.locator("body").inner_text(timeout=2000))
+                            except Exception:
+                                issue = None
+                            if issue and issue != detected_notice:
+                                detected_notice = issue
+                                self.attention_required.emit(issue)
+                        if not delayed_notice_sent and time.monotonic() - login_started >= 90:
+                            delayed_notice_sent = True
+                            self.attention_required.emit(user_error("LOGIN_DELAYED"))
                         page.wait_for_timeout(250)
                     if self.stopping.is_set() or page.is_closed():
                         context.close()
@@ -157,7 +250,7 @@ class EsmBrowserWorker(QThread):
                     # 컨텍스트를 그대로 사용하고 주문 화면 확인 후 창만 최소화한다.
                     page.goto(ORDERS_URL, wait_until="domcontentloaded")
                     if not is_logged_in_url(page.url):
-                        raise ValueError("ESM 로그인 완료를 확인하지 못했습니다. 열린 Chrome에서 로그인을 다시 확인해주세요.")
+                        raise ValueError(user_error("SESSION_EXPIRED"))
                     minimized = minimize_browser_window(context, page)
                     self.status_changed.emit(
                         "ESM 로그인 세션 확인 · 브라우저를 최소화하고 백그라운드 수집을 준비했습니다."
@@ -178,7 +271,7 @@ class EsmBrowserWorker(QThread):
                         continue
                     if not is_logged_in_url(page.url):
                         self.ready.emit(False)
-                        self.failed.emit("ESM 로그인 후 수집을 시작해주세요.")
+                        self.failed.emit(user_error("SESSION_EXPIRED"))
                         self.collecting_changed.emit(False)
                         continue
                     self.collecting_changed.emit(True)
@@ -193,13 +286,18 @@ class EsmBrowserWorker(QThread):
                             session.manifest["state"] = "중지" if self.cancelled.is_set() else "실패"
                             session.save()
                         # 브라우저 예외에는 요청 주소/데이터가 포함될 수 있어 그대로 기록하지 않는다.
-                        message = str(exc) if isinstance(exc, ValueError) else "ESM 화면 응답 또는 다운로드를 확인하지 못했습니다. 열린 브라우저를 확인하고 다시 수집해주세요."
+                        message = str(exc) if isinstance(exc, ValueError) else classify_browser_error(exc, "collect")
                         self.failed.emit(message)
                     finally:
                         self.collecting_changed.emit(False)
                 context.close()
         except Exception as exc:
-            self.failed.emit(str(exc) if isinstance(exc, ValueError) else "ESM 브라우저를 열지 못했습니다. Chrome/Edge 설치와 네트워크 연결을 확인해주세요.")
+            if isinstance(exc, ValueError) and str(exc).startswith("[ESM-"):
+                self.failed.emit(str(exc))
+            elif isinstance(exc, ValueError) and "설치되어 있지" in str(exc):
+                self.failed.emit(user_error("BROWSER_NOT_FOUND"))
+            else:
+                self.failed.emit(classify_browser_error(exc))
         finally:
             self.ready.emit(False)
 
@@ -255,13 +353,13 @@ class EsmBrowserWorker(QThread):
                     notice_confirmed = True
                 page.wait_for_timeout(200)
             if not downloads:
-                raise ValueError("원본 다운로드를 확인하지 못했습니다. ESM 브라우저의 안내를 확인한 뒤 다시 수집해주세요.")
+                raise ValueError(user_error("DOWNLOAD"))
             download = downloads[0]
             with tempfile.TemporaryDirectory(prefix="reqm-esm-") as temp:
                 path = Path(temp) / "download.xls"
                 download.save_as(path)
                 if download.failure():
-                    raise ValueError("ESM 파일 다운로드가 실패했습니다.")
+                    raise ValueError(user_error("DOWNLOAD", "브라우저가 파일 다운로드 실패를 반환했습니다."))
                 session.archive(path, status, count, download.suggested_filename)
         finally:
             page.remove_listener("download", listener)

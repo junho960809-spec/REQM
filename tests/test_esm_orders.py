@@ -10,7 +10,10 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from esm_orders import EsmSession, STATUSES, channel_for, read_esm, merge_orders, export_summary, export_esm_original_format
-from esm_browser import browser_channels, date_windows, installed_browser, is_logged_in_url, minimize_browser_window
+from esm_browser import (
+    browser_channels, classify_browser_error, date_windows, detect_login_issue,
+    installed_browser, is_logged_in_url, minimize_browser_window,
+)
 from ecount_sales_core import ReferenceCatalog, convert_orders
 
 
@@ -76,6 +79,15 @@ def test_authenticated_browser_is_minimized_without_relaunching():
     page = object()
     assert minimize_browser_window(Context(), page)
     assert ("Browser.setWindowBounds", {"windowId": 17, "bounds": {"windowState": "minimized"}}) in calls
+
+
+def test_esm_errors_distinguish_credentials_network_and_profile_lock():
+    assert "LOGIN_CREDENTIALS" in detect_login_issue("아이디 또는 비밀번호가 일치하지 않습니다")
+    assert "ACCOUNT_RESTRICTED" in detect_login_issue("로그인 실패 횟수 초과로 계정이 잠겼습니다")
+    assert detect_login_issue("비밀번호를 입력해주세요. 비밀번호 재설정") is None
+    assert "NETWORK" in classify_browser_error(RuntimeError("net::ERR_NAME_NOT_RESOLVED"))
+    assert "PROFILE_LOCKED" in classify_browser_error(RuntimeError("ProcessSingleton profile in use"))
+    assert "DOWNLOAD" in classify_browser_error(RuntimeError("unknown"), "download")
 
 
 @pytest.mark.parametrize("quantity,coupon", [(0, 0), ("", 0), ("nan", 0), (1.5, 0), (1, ""), (1, "bad"), (1, 999999), (1, -1)])
