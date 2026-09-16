@@ -679,14 +679,16 @@ def read_sellmate_orders(
                 if shipping_total == 0:
                     shipping_total = as_decimal(shipping_rule.get("default_fee", 0))
             item_total = amount
-            normalized_channel = normalize_source(channel)
-            if normalized_channel in {
-                normalize_source("삼성카드 복지몰"),
-                normalize_source("삼성카드 쇼핑몰"),
-            } and quantity >= 2:
-                item_total = option_total
             shipping_method = shipping_rule.get("method", "separate")
-            if shipping_method == "subtract" and shipping_total > 0:
+            if shipping_method == "separate_subtract" and shipping_total > 0:
+                # D열 금액은 주문 총액이다. 배송비를 별도 전표 품목으로 남기면서
+                # 동일 금액을 본품에서 차감해야 전표 합계가 D열과 일치한다.
+                item_total = amount - shipping_total
+                if item_total < 0:
+                    raise ValueError(
+                        f"셀메이트 파일 {source_row}행의 {channel} 상품금액보다 배송비가 큽니다."
+                    )
+            elif shipping_method == "subtract" and shipping_total > 0:
                 item_total = amount - shipping_total
                 if item_total < 0:
                     raise ValueError(

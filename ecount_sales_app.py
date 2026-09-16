@@ -1416,6 +1416,7 @@ class MarketplaceSettingsDialog(QDialog):
 
     METHOD_LABELS = {
         "separate": "배송비 품목으로 분리",
+        "separate_subtract": "배송비 분리 + 본품에서 차감",
         "subtract": "상품금액에서 차감",
         "included": "상품금액에 포함",
         "exclude": "전표에서 제외",

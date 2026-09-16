@@ -7,12 +7,12 @@ from pathlib import Path
 
 
 SETTINGS_PATH = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "REQM" / "channel_shipping_rules.json"
-DEFAULT_RULE = {"method": "separate", "source": "custom10", "default_fee": 0,
+DEFAULT_RULE = {"method": "separate_subtract", "source": "custom10", "default_fee": 0,
                 "island": "already_included", "active": True}
 DEFAULT_RULES = {
     "스마트스토어": {**DEFAULT_RULE, "source": "shipping_total"},
-    "오늘의집": {**DEFAULT_RULE, "method": "subtract"},
-    "11번가": {**DEFAULT_RULE, "source": "amount_minus_unit"},
+    "오늘의집": {**DEFAULT_RULE, "method": "separate_subtract"},
+    "11번가": {**DEFAULT_RULE, "method": "separate_subtract", "source": "amount_minus_unit"},
     "지마켓": {**DEFAULT_RULE, "method": "exclude", "source": "none"},
     "옥션": {**DEFAULT_RULE, "method": "exclude", "source": "none"},
 }
@@ -28,7 +28,19 @@ def load_shipping_rules(path: Path = SETTINGS_PATH) -> dict[str, dict]:
     rules = {name: dict(value) for name, value in DEFAULT_RULES.items()}
     for name, value in loaded.items():
         if isinstance(value, dict):
-            rules[str(name)] = {**DEFAULT_RULE, **value}
+            normalized_name = "".join(str(name).split()).casefold()
+            migrated = {**DEFAULT_RULE, **value}
+            # 2026-09-16 이전 기본값은 오늘의집 배송비를 차감만 하고 배송비
+            # 품목을 없앴으며, 11번가는 분리만 했다. 새 복합 규칙으로 자동 이관한다.
+            if normalized_name == "오늘의집".casefold() and migrated.get("method") == "subtract":
+                migrated["method"] = "separate_subtract"
+            if (
+                normalized_name == "11번가".casefold()
+                and migrated.get("method") == "separate"
+                and migrated.get("source") == "amount_minus_unit"
+            ):
+                migrated["method"] = "separate_subtract"
+            rules[str(name)] = migrated
     return rules
 
 

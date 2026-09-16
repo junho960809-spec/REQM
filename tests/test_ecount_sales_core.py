@@ -22,6 +22,7 @@ from ecount_sales_core import (
     read_smartstore_orders_range,
     write_ecount_workbook,
 )
+from channel_settings import load_shipping_rules, shipping_rule_for
 
 
 class SalesCoreTests(unittest.TestCase):
@@ -505,10 +506,10 @@ class SalesCoreTests(unittest.TestCase):
             self.assertEqual(orders[0].item_total, Decimal("36900.00"))
             self.assertEqual(orders[0].shipping_total, Decimal("3000.00"))
             self.assertEqual(orders[1].item_total, Decimal("29900.00"))
-            self.assertEqual(orders[1].shipping_total, Decimal("0.00"))
+            self.assertEqual(orders[1].shipping_total, Decimal("3000.00"))
             self.assertEqual(orders[1].paid_at.date(), date(2026, 9, 8))
 
-    def test_sellmate_todayhouse_deducts_shipping_without_shipping_line(self) -> None:
+    def test_sellmate_todayhouse_deducts_shipping_and_keeps_shipping_line(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "todayhouse.xlsx"
             from openpyxl import Workbook
@@ -529,7 +530,25 @@ class SalesCoreTests(unittest.TestCase):
             orders = read_sellmate_orders(source, date(2026, 9, 8))
 
             self.assertEqual(orders[0].item_total, Decimal("29900.00"))
-            self.assertEqual(orders[0].shipping_total, Decimal("0.00"))
+            self.assertEqual(orders[0].shipping_total, Decimal("3000.00"))
+            self.assertEqual(orders[0].item_total + orders[0].shipping_total, Decimal("32900.00"))
+
+    def test_legacy_shipping_rules_migrate_to_separate_and_subtract(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "shipping.json"
+            path.write_text(
+                '{"오늘의집":{"method":"subtract","source":"custom10"},'
+                '"11번가":{"method":"separate","source":"amount_minus_unit"}}',
+                encoding="utf-8",
+            )
+            rules = load_shipping_rules(path)
+            self.assertEqual(rules["오늘의집"]["method"], "separate_subtract")
+            self.assertEqual(rules["11번가"]["method"], "separate_subtract")
+
+    def test_unregistered_sellmate_channel_uses_composite_shipping_by_default(self) -> None:
+        rule = shipping_rule_for("신규 판매처", {})
+        self.assertEqual(rule["method"], "separate_subtract")
+        self.assertEqual(rule["source"], "custom10")
 
     def test_sellmate_uses_saved_channel_shipping_method(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -547,7 +566,7 @@ class SalesCoreTests(unittest.TestCase):
             self.assertEqual(orders[0].item_total, Decimal("30000.00"))
             self.assertEqual(orders[0].shipping_total, Decimal("0.00"))
 
-    def test_sellmate_samsung_card_uses_unit_price_times_quantity(self) -> None:
+    def test_sellmate_samsung_card_uses_d_column_total_for_all_quantities(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / "samsung.xlsx"
             from openpyxl import Workbook
@@ -573,7 +592,7 @@ class SalesCoreTests(unittest.TestCase):
             orders = read_sellmate_orders(source, date(2026, 9, 8))
 
             self.assertEqual([order.item_total for order in orders], [
-                Decimal("53800.00"), Decimal("53800.00"), Decimal("25400.00")
+                Decimal("26900.00"), Decimal("26900.00"), Decimal("25400.00")
             ])
 
     def test_conversion_uses_each_sellmate_channel_customer(self) -> None:
