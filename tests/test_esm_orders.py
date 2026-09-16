@@ -10,7 +10,7 @@ import pytest
 from openpyxl import Workbook, load_workbook
 
 from esm_orders import EsmSession, STATUSES, channel_for, read_esm, merge_orders, export_summary, export_esm_original_format
-from esm_browser import browser_channels, date_windows, installed_browser, is_logged_in_url
+from esm_browser import browser_channels, date_windows, installed_browser, is_logged_in_url, minimize_browser_window
 from ecount_sales_core import ReferenceCatalog, convert_orders
 
 
@@ -55,6 +55,27 @@ def test_esm_login_url_detection():
     assert is_logged_in_url("https://www.esmplus.com/Home/Home")
     assert is_logged_in_url("https://www.esmplus.com/Escrow/SmartDelivery/test")
     assert not is_logged_in_url("https://signin.esmplus.com/login")
+
+
+def test_authenticated_browser_is_minimized_without_relaunching():
+    calls = []
+
+    class Cdp:
+        def send(self, name, payload=None):
+            calls.append((name, payload))
+            return {"windowId": 17} if name == "Browser.getWindowForTarget" else {}
+
+        def detach(self):
+            calls.append(("detach", None))
+
+    class Context:
+        def new_cdp_session(self, page):
+            calls.append(("session", page))
+            return Cdp()
+
+    page = object()
+    assert minimize_browser_window(Context(), page)
+    assert ("Browser.setWindowBounds", {"windowId": 17, "bounds": {"windowState": "minimized"}}) in calls
 
 
 @pytest.mark.parametrize("quantity,coupon", [(0, 0), ("", 0), ("nan", 0), (1.5, 0), (1, ""), (1, "bad"), (1, 999999), (1, -1)])

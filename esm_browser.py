@@ -71,6 +71,23 @@ def is_logged_in_url(url_value: str) -> bool:
     return url.hostname == "www.esmplus.com" and url.path.startswith(("/Home", "/Escrow"))
 
 
+def minimize_browser_window(context, page) -> bool:
+    """Minimize the authenticated Chromium window without restarting its session."""
+    try:
+        cdp = context.new_cdp_session(page)
+        window = cdp.send("Browser.getWindowForTarget")
+        cdp.send(
+            "Browser.setWindowBounds",
+            {"windowId": window["windowId"], "bounds": {"windowState": "minimized"}},
+        )
+        cdp.detach()
+        return True
+    except Exception:
+        # 로그인 세션 유지가 우선이다. 최소화가 지원되지 않는 환경에서는 열린
+        # 브라우저를 그대로 사용하고 세션 재실행은 시도하지 않는다.
+        return False
+
+
 class EsmBrowserWorker(QThread):
     status_changed = Signal(str)
     ready = Signal(bool)
@@ -135,14 +152,22 @@ class EsmBrowserWorker(QThread):
                     if self.stopping.is_set() or page.is_closed():
                         context.close()
                         return
-                    # 쿠키가 프로필에 저장된 뒤 표시 브라우저를 닫고 headless로 다시 연다.
-                    context.close()
-                    context, page = launch(True)
+                    # 로그인 직후 컨텍스트를 닫고 headless로 다시 열면 ESM 인증
+                    # 쿠키/스토리지가 기록되기 전에 세션이 끊길 수 있다. 현재 로그인된
+                    # 컨텍스트를 그대로 사용하고 주문 화면 확인 후 창만 최소화한다.
                     page.goto(ORDERS_URL, wait_until="domcontentloaded")
                     if not is_logged_in_url(page.url):
-                        raise ValueError("ESM 로그인 세션을 백그라운드 브라우저로 전환하지 못했습니다. 다시 로그인해주세요.")
+                        raise ValueError("ESM 로그인 완료를 확인하지 못했습니다. 열린 Chrome에서 로그인을 다시 확인해주세요.")
+                    minimized = minimize_browser_window(context, page)
+                    self.status_changed.emit(
+                        "ESM 로그인 세션 확인 · 브라우저를 최소화하고 백그라운드 수집을 준비했습니다."
+                        if minimized else
+                        "ESM 로그인 세션 확인 · 현재 브라우저 세션을 유지해 수집을 준비했습니다."
+                    )
                 self.ready.emit(True)
-                self.status_changed.emit("ESM 로그인 세션 확인 · 이후 조회와 다운로드는 백그라운드에서 실행됩니다.")
+                if page.url != ORDERS_URL:
+                    page.goto(ORDERS_URL, wait_until="domcontentloaded")
+                self.status_changed.emit("ESM 로그인 세션 확인 · 조회와 다운로드를 준비했습니다.")
                 while not self.stopping.is_set():
                     if page.is_closed():
                         break
