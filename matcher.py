@@ -14,6 +14,14 @@ def compact(value: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", normalize(value))
 
 
+def order_source_text(order: dict[str, Any]) -> str:
+    base = " ".join(filter(None, [order.get("product_name", ""), order.get("options", "")]))
+    model = str(order.get("model", "") or "").strip()
+    if model and compact(model) not in compact(base):
+        base = f"{base} {model}".strip()
+    return base
+
+
 class ProductMatcher:
     def __init__(self, items: list[dict[str, Any]], products: list[dict[str, Any]], components: list[dict[str, Any]], aliases: list[dict[str, Any]] | None = None):
         self.items = [row for row in items if row.get("is_active", True)]
@@ -22,8 +30,12 @@ class ProductMatcher:
         for row in components:
             self.components_by_product[str(row.get("registered_product_id", ""))].append(row)
         self.items_by_exact: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.items_by_code: dict[str, dict[str, Any]] = {}
         for item in self.items:
             self.items_by_exact[compact(str(item.get("standard_name", "")))].append(item)
+            item_code = str(item.get("item_code", "")).strip()
+            if item_code:
+                self.items_by_code[item_code.casefold()] = item
         self.products_by_exact: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for product in self.products:
             key = compact(str(product.get("normalized_name") or product.get("original_name", "")))
@@ -74,7 +86,17 @@ class ProductMatcher:
         return "similar", [candidates[0][1]], f"유사 품목 일치 {top_score:.0%}"
 
     def match(self, order: dict[str, str]) -> dict[str, str]:
-        alias_key = compact(" ".join(filter(None, [order.get("product_name", ""), order.get("options", "")])))
+        source_item_code = str(order.get("source_item_code", "")).strip()
+        if source_item_code:
+            item = self.items_by_code.get(source_item_code.casefold())
+            if item:
+                return {
+                    "status": "exact",
+                    "matched_product": str(item.get("standard_name", "")),
+                    "components": str(item.get("item_code", "")),
+                    "reason": "파일 품목코드 DB 정확 일치",
+                }
+        alias_key = compact(order_source_text(order))
         alias = self.aliases.get((order.get("channel", ""), alias_key)) or self.aliases.get(("", alias_key))
         if alias:
             components = alias.get("components") or []
@@ -111,12 +133,19 @@ class ProductMatcher:
                 "reason": " | ".join(notes),
             }
 
-        source = " ".join(filter(None, [order.get("product_name", ""), order.get("options", "")]))
+        source = order_source_text(order)
         key = compact(source)
         exact = self.products_by_exact.get(key, [])
         if len(exact) == 1:
             product = exact[0]
             components = self.components_by_product.get(str(product.get("registered_product_id", "")), [])
+            if not components:
+                return {
+                    "status": "missing",
+                    "matched_product": str(product.get("original_name", "")),
+                    "components": "",
+                    "reason": "등록상품의 구성 품목이 삭제됨 · 재연결 필요",
+                }
             return {
                 "status": "exact",
                 "matched_product": str(product.get("original_name", "")),
@@ -132,7 +161,10 @@ class ProductMatcher:
                 scored.append((score, product))
         scored.sort(key=lambda x: x[0], reverse=True)
         if not scored:
-            return {"status": "missing", "matched_product": "", "components": "", "reason": "등록상품 DB에 없음"}
+            reason = "등록상품 DB에 없음"
+            if source_item_code:
+                reason = f"파일 품목코드 {source_item_code} DB 미등록 · 품목명도 일치하지 않음"
+            return {"status": "missing", "matched_product": "", "components": "", "reason": reason}
         top_score = scored[0][0]
         close = [product for score, product in scored if top_score - score <= 0.025]
         if len(close) > 1:
@@ -144,6 +176,13 @@ class ProductMatcher:
             }
         product = scored[0][1]
         components = self.components_by_product.get(str(product.get("registered_product_id", "")), [])
+        if not components:
+            return {
+                "status": "missing",
+                "matched_product": str(product.get("original_name", "")),
+                "components": "",
+                "reason": "등록상품의 구성 품목이 삭제됨 · 재연결 필요",
+            }
         return {
             "status": "similar",
             "matched_product": str(product.get("original_name", "")),
