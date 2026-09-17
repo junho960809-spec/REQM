@@ -20,6 +20,12 @@ CHANNEL_NAME = "리큐엠_스마트스토어"
 MONEY = Decimal("0.01")
 
 
+def display_channel_name(value: str) -> str:
+    """Return a user-facing marketplace name while preserving DB channel keys internally."""
+    name = str(value or "").strip()
+    return "스마트스토어" if name == CHANNEL_NAME else name
+
+
 def normalize_source(value: str) -> str:
     return re.sub(r"[^0-9a-z가-힣]", "", (value or "").lower())
 
@@ -1138,9 +1144,9 @@ def write_ecount_workbook(
     _style_upload_sheet(upload, ordered_lines)
 
     review = workbook.create_sheet("검수결과")
-    review.append(["구분", "입력파일", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
+    review.append(["구분", "판매처", "원본행", "주문번호", "품목/옵션", "수량", "금액", "결과/사유"])
     for issue in result.issues:
-        review.append(["확인필요", issue.source_type, issue.source_row, issue.order_no, f"{issue.product_name} / {issue.options}", float(issue.quantity), float(issue.amount), issue.reason])
+        review.append(["확인필요", display_channel_name(issue.source_channel), issue.source_row, issue.order_no, f"{issue.product_name} / {issue.options}", float(issue.quantity), float(issue.amount), issue.reason])
     review.append([])
     review.append(["검수 항목", "결과"])
     review.append(["대상 주문행", len(result.orders)])

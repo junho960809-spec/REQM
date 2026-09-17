@@ -9,17 +9,20 @@ from decimal import Decimal
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QAbstractItemView, QTabWidget
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QLabel, QTabWidget
 
 from pathlib import Path
 
 from ecount_sales_app import (
     ItemOrderDetailsDialog, MarketplaceSettingsDialog, SalesLoginDialog, SalesVoucherWindow,
+    SingleMappingDialog,
     clear_saved_login, load_saved_login, save_login, show_authenticated_window,
     split_voucher_line_total,
 )
 from ecount_sales_api_dialog import EcountSalesApiDialog
-from ecount_sales_core import ConversionResult, ItemOrderDetail, SmartStoreOrder, VoucherLine
+from ecount_sales_core import (
+    ConversionResult, ItemOrderDetail, ReviewIssue, SmartStoreOrder, VoucherLine,
+)
 
 
 class SalesAppEditTests(unittest.TestCase):
@@ -146,6 +149,45 @@ class SalesAppEditTests(unittest.TestCase):
         self.assertTrue(visibility["오늘의집"])
         self.assertFalse(visibility["11번가"])
         window.close()
+
+    def test_review_table_shows_sales_channel_instead_of_source_type(self) -> None:
+        issue = ReviewIssue(
+            2, "ORDER-1", "상품", "블랙", Decimal("1"), Decimal("26900"),
+            "상품/옵션 조합이 DB에 없습니다.", source_type="셀메이트", source_channel="오늘의집",
+        )
+        result = ConversionResult(orders=[], lines=[], issues=[issue])
+        window = SalesVoucherWindow()
+        window.current_result = result
+        window._show_result(result)
+
+        self.assertEqual(window.issues_table.horizontalHeaderItem(0).text(), "판매처")
+        self.assertEqual(window.issues_table.item(0, 0).text(), "오늘의집")
+        self.assertEqual(window.issues_table.horizontalHeaderItem(5).text(), "엑셀 적용금액")
+        window.close()
+
+    def test_internal_smartstore_channel_is_displayed_friendly(self) -> None:
+        issue = ReviewIssue(
+            2, "ORDER-1", "상품", "", Decimal("1"), Decimal("1000"), "확인",
+            source_channel="리큐엠_스마트스토어",
+        )
+        window = SalesVoucherWindow()
+        window._show_result(ConversionResult(orders=[], lines=[], issues=[issue]))
+        self.assertEqual(window.issues_table.item(0, 0).text(), "스마트스토어")
+        window.close()
+
+    def test_single_mapping_dialog_keeps_excel_amount_read_only(self) -> None:
+        order = SmartStoreOrder(
+            2, "ORDER-1", "PRODUCT-1", datetime(2026, 9, 9), "", "상품", "블랙",
+            Decimal("2"), Decimal("53800"), source_type="셀메이트", source_channel="오늘의집",
+        )
+        dialog = SingleMappingDialog(
+            order,
+            {"ITEM-1": {"representative_name": "테스트 품목"}},
+        )
+        self.assertIn("53,800원", " ".join(label.text() for label in dialog.findChildren(QLabel)))
+        dialog.item_combo.setCurrentIndex(dialog.item_combo.findData("ITEM-1"))
+        self.assertEqual(dialog.item_code(), "ITEM-1")
+        dialog.close()
 
     def test_main_screen_uses_compact_workflow_navigation(self) -> None:
         window = SalesVoucherWindow()

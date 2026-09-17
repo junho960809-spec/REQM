@@ -53,6 +53,7 @@ from ecount_sales_core import (
     VoucherLine,
     convert_orders,
     detect_smartstore_order_period,
+    display_channel_name,
     find_order_for_issue,
     normalize_source,
     order_matches_issue,
@@ -435,6 +436,73 @@ class SalesLoginDialog(QDialog):
         self.login_button.setEnabled(True); self.login_button.setText("로그인")
         if self.client is not None and self.catalog is not None:
             QTimer.singleShot(0, self.accept)
+
+
+class SingleMappingDialog(QDialog):
+    """Connect an unknown source product to one DB item without re-entering price."""
+
+    def __init__(self, order, items: dict[str, dict], parent=None) -> None:
+        super().__init__(parent)
+        self.items = items
+        self.setWindowTitle("미등록 단품 연결")
+        self.resize(620, 250)
+
+        layout = QVBoxLayout(self)
+        title = QLabel(f"{order.product_name}\n옵션: {order.options or '(없음)'}")
+        title.setStyleSheet("font-weight:700;color:#173F5F;")
+        layout.addWidget(title)
+        amount = QLabel(
+            f"엑셀 적용 금액: {order.item_total:,.0f}원  |  수량: {order.quantity:,.0f}개"
+        )
+        amount.setStyleSheet("color:#047857;font-weight:700;")
+        layout.addWidget(amount)
+        guide = QLabel(
+            "금액은 엑셀 원본 값을 그대로 사용합니다. 연결할 이카운트 품목만 선택해주세요."
+        )
+        guide.setStyleSheet("color:#526D82;")
+        layout.addWidget(guide)
+
+        self.item_combo = QComboBox()
+        self.item_combo.setEditable(True)
+        self.item_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.item_combo.addItem("품목코드 또는 품목명 검색", "")
+        completion_labels = []
+        for code, item in sorted(items.items()):
+            name = str(
+                item.get("representative_name")
+                or item.get("item_name")
+                or item.get("standard_name")
+                or code
+            )
+            label = f"{code} | {name}"
+            self.item_combo.addItem(label, code)
+            completion_labels.append(label)
+        completer = QCompleter(completion_labels, self.item_combo)
+        completer.setCaseSensitivity(Qt.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchContains)
+        completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.item_combo.setCompleter(completer)
+        layout.addWidget(self.item_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Save).setText("품목 연결 및 다시 분석")
+        buttons.accepted.connect(self.validate_and_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def item_code(self) -> str:
+        code = str(self.item_combo.currentData() or "").strip()
+        if not code:
+            typed = self.item_combo.currentText().split("|", 1)[0].strip()
+            if typed in self.items:
+                code = typed
+        return code
+
+    def validate_and_accept(self) -> None:
+        if self.item_code() not in self.items:
+            QMessageBox.warning(self, "품목 확인", "판매전표 DB 품목을 선택해주세요.")
+            return
+        self.accept()
 
 
 class SetMappingDialog(QDialog):
@@ -1965,7 +2033,7 @@ class SalesVoucherWindow(QMainWindow):
         self.pivot_tab_index = tabs.addTab(pivot_tab, "품목 집계")
 
         self.issues_table.setColumnCount(7)
-        self.issues_table.setHorizontalHeaderLabels(["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"])
+        self.issues_table.setHorizontalHeaderLabels(["판매처", "원본행", "주문번호", "상품명", "옵션", "엑셀 적용금액", "확인 사유"])
         self.issues_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -1974,14 +2042,14 @@ class SalesVoucherWindow(QMainWindow):
         self.issues_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.issues_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
         self.issues_table.cellDoubleClicked.connect(self.open_set_mapping_dialog)
-        self.issues_table.setToolTip("확인 필요 항목을 더블클릭하면 Supabase 세트 품목과 금액을 연결할 수 있습니다.")
+        self.issues_table.setToolTip("미등록 단품은 품목만 연결하고, 세트는 구성품과 배분 금액을 연결합니다.")
         issues_tab = QWidget()
         issues_layout = QVBoxLayout(issues_tab)
         issues_layout.setContentsMargins(5, 5, 5, 5)
         self._add_column_filter(
             issues_layout,
             self.issues_table,
-            ["입력파일", "원본행", "주문번호", "상품명", "옵션", "금액", "확인 사유"],
+            ["판매처", "원본행", "주문번호", "상품명", "옵션", "엑셀 적용금액", "확인 사유"],
         )
         issues_layout.addWidget(self.issues_table)
         self.issues_tab_index = tabs.addTab(issues_tab, "확인 필요")
@@ -2541,7 +2609,7 @@ class SalesVoucherWindow(QMainWindow):
         self.result_channel_filter.blockSignals(True)
         self.result_channel_filter.clear()
         self.result_channel_filter.addItem("전체 판매처")
-        self.result_channel_filter.addItems(sorted({line.source_channel for line in result.lines if line.source_channel}))
+        self.result_channel_filter.addItems(sorted({display_channel_name(line.source_channel) for line in result.lines if line.source_channel}))
         self.result_channel_filter.setCurrentText(
             selected_channel if self.result_channel_filter.findText(selected_channel) >= 0 else "전체 판매처"
         )
@@ -2552,7 +2620,7 @@ class SalesVoucherWindow(QMainWindow):
             values = [
                 line.item_code,
                 line.item_name,
-                line.source_channel,
+                display_channel_name(line.source_channel),
                 f"{line.quantity:,.0f}",
                 f"{line.unit_price:,.0f}",
                 f"{line.total:,.0f}",
@@ -2588,7 +2656,7 @@ class SalesVoucherWindow(QMainWindow):
         self.issues_table.setRowCount(len(result.issues))
         for row_index, issue in enumerate(result.issues):
             values = [
-                issue.source_type,
+                display_channel_name(issue.source_channel),
                 issue.source_row,
                 issue.order_no,
                 issue.product_name,
@@ -3468,6 +3536,9 @@ class SalesVoucherWindow(QMainWindow):
         order = find_order_for_issue(self.current_result.orders, issue)
         if order is None:
             return
+        if issue.reason == "상품/옵션 조합이 DB에 없습니다.":
+            self._connect_single_order(order)
+            return
         existing_mapping = self.catalog.mapping_for(order.source_channel, order.normalized_source) or {}
         dialog = SetMappingDialog(
             order,
@@ -3609,25 +3680,25 @@ class SalesVoucherWindow(QMainWindow):
         order = find_order_for_issue(self.current_result.orders, issue)
         if order is None:
             return
-        item_code, ok = QInputDialog.getText(
-            self,
-            "DB에 단품 바로 추가",
-            f"{order.product_name}\n{order.options}\n\n연결할 이카운트 품목코드:",
-        )
-        item_code = item_code.strip()
-        if not ok or not item_code:
+        self._connect_single_order(order)
+
+    def _connect_single_order(self, order) -> None:
+        """Save only the product identity; order amount always remains Excel-derived."""
+        if self.catalog is None or self.supabase_client is None:
             return
-        if item_code not in self.catalog.items:
-            QMessageBox.warning(self, "품목코드 확인", "판매전표 DB에 존재하는 품목코드를 입력해주세요.")
+        dialog = SingleMappingDialog(order, self.catalog.items, self)
+        if dialog.exec() != QDialog.Accepted:
             return
+        item_code = dialog.item_code()
         source_text = f"{order.product_name}{order.options}"
         mapping_key = hashlib.sha256(
             f"{order.source_channel}|{order.normalized_source}".encode("utf-8")
         ).hexdigest()
         answer = QMessageBox.question(
             self,
-            "DB 추가 확인",
-            f"선택 상품을 단품 {item_code}로 등록하고 즉시 다시 분석할까요?",
+            "단품 연결 확인",
+            f"선택 상품을 {item_code}에 연결할까요?\n"
+            f"금액 {order.item_total:,.0f}원은 엑셀 원본 값을 사용합니다.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
